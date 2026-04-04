@@ -53,7 +53,7 @@ The interface has three panels:
 2. **Center panel** — displays the raw bytecode disassembly
 3. **Right panel** — shows the recovered Python source code
 
-Additional GUI features:
+Additional GUI features(BETA):
 - **Annotations** — rename variables/functions and add comments, saved alongside the binary as `.annotations.json`
 - **CFG Viewer** — visualize the control flow graph of any function
 - **Diff View** — compare decompilations of two files side by side
