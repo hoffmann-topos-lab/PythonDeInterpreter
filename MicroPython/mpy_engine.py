@@ -1,25 +1,8 @@
-"""
-Entry point do subprocess MicroPython.
-
-Equivalente ao Decompiler/engine.py, mas para arquivos .mpy.
-
-Saída via stdout com os mesmos section markers do engine CPython:
-    ===== BYTECODE =====
-    ===== BYTECODE_META =====
-    ===== RECOVERED =====
-
-O formato do BYTECODE usa cabeçalhos compatíveis com ui_parsers.parse_bytecode():
-    Disassembly of <code object NAME at 0xIDX, file "PATH", line N>:
-
-Uso:
-    python3.12 MicroPython/mpy_engine.py <arquivo.mpy>
-"""
-
 import sys
 import os
 import json
 
-# Garante que v0.5/ está no path (subprocess pode ser chamado com qualquer cwd)
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
@@ -33,7 +16,7 @@ from utils.codegen import generate_python_code
 
 
 def _build_hierarchy(tree):
-    """Constrói hierarquia JSON-serializável a partir da árvore de extração."""
+
     name = tree.get("name", "?")
     ra = tree.get("recovered_ast") or {}
     children = tree.get("children", [])
@@ -67,12 +50,8 @@ def _build_hierarchy(tree):
     }
 
 
-# ---------------------------------------------------------------------------
-# Geração do disassembly textual
-# ---------------------------------------------------------------------------
 
 def _collect_all(mpy_obj: MpyCodeObject) -> list:
-    """Retorna todos os MpyCodeObjects em pré-ordem (raiz primeiro)."""
     result = [mpy_obj]
     for child in mpy_obj._children:
         result.extend(_collect_all(child))
@@ -80,27 +59,18 @@ def _collect_all(mpy_obj: MpyCodeObject) -> list:
 
 
 def _format_disassembly(root: MpyCodeObject, filename: str) -> tuple[str, list]:
-    """
-    Formata o disassembly de todos os code objects com cabeçalhos
-    compatíveis com ui_parsers.parse_bytecode().
 
-    Retorna:
-        bytecode_text  — string completa para a seção BYTECODE
-        meta_entries   — list de (name, addr_hex, line_no_in_text)
-    """
     lines      = []
     meta_entries = []
-    line_cursor  = 0   # número da linha atual no texto gerado (1-based)
+    line_cursor  = 0  
 
     all_objs = _collect_all(root)
 
     for idx, obj in enumerate(all_objs):
         name    = obj.co_name or f"<code_{idx}>"
-        # Endereço fake: usa índice na lista como identificador único
         addr    = f"0x{idx:08x}"
         firstln = obj.co_firstlineno
 
-        # Cabeçalho no formato que ui_parsers.py espera
         header = (
             f'Disassembly of <code object {name} at {addr}, '
             f'file "{filename}", line {firstln}>:'
@@ -144,9 +114,6 @@ def _format_disassembly(root: MpyCodeObject, filename: str) -> tuple[str, list]:
     return "\n".join(lines), meta_entries
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main():
     if len(sys.argv) < 2:
@@ -171,10 +138,7 @@ def main():
         arch_code=arch_code,
     )
 
-    # ------------------------------------------------------------------
-    # Pipeline primeiro: atualiza co_name dos filhos (infere nomes reais)
-    # Depois gera o disassembly com nomes já corrigidos.
-    # ------------------------------------------------------------------
+
     try:
         tree = process_mpy_code_object(root, debug=False)
         recovered = generate_python_code(tree, debug=False)
@@ -182,20 +146,15 @@ def main():
         tree      = None
         recovered = f"# [ERRO na recuperação de código: {exc}]"
 
-    # ------------------------------------------------------------------
-    # Seção BYTECODE (gerada após pipeline — co_name já atualizado)
-    # ------------------------------------------------------------------
+
     bytecode_text, meta_entries = _format_disassembly(root, mpy_path)
 
     print("===== BYTECODE =====")
     print(bytecode_text.rstrip())
 
-    # ------------------------------------------------------------------
-    # Seção BYTECODE_META
-    # ------------------------------------------------------------------
     print("\n===== BYTECODE_META =====")
 
-    # Primeira linha: metadados do arquivo .mpy (para a UI exibir info do formato)
+
     print(f"__mpy__|v6.{sub_ver}|{arch_name}")
 
     for name, addr, line_no in meta_entries:
@@ -203,9 +162,7 @@ def main():
     if tree:
         print(f"__hierarchy__|{json.dumps(_build_hierarchy(tree))}")
 
-    # ------------------------------------------------------------------
-    # Seção RECOVERED
-    # ------------------------------------------------------------------
+
     print("\n===== RECOVERED =====")
     print(recovered)
 
