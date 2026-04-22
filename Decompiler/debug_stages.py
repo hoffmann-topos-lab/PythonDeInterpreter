@@ -1,15 +1,20 @@
 import sys
 import os
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)                    # Decompiler/ — loader, disasm, etc.
-sys.path.insert(0, os.path.dirname(_HERE))   # v0.5/ — utils.*
+sys.path.insert(0, _HERE)                    
+sys.path.insert(0, os.path.dirname(_HERE))   
 import dis
 import types
 import argparse
-
-# ---------------------------------------------------------------------------
-# Detecção de formato: delega para mpy_debug_stages se o arquivo for .mpy
-# ---------------------------------------------------------------------------
+from utils.ir import stmt_repr, expr_repr
+from loader import load_code_object, _find_code_by_name
+from extract import extract_code_objects
+from utils.codegen import generate_python_code
+from disasm import parse_instructions
+from utils.cfg import build_basic_blocks, build_cfg
+from stack_sim import simulate_stack
+from patterns import detect_high_level_patterns
+from utils.ast_recover import build_recovered_ast
 
 def _is_mpy(path: str) -> bool:
     if not path.lower().endswith(".mpy"):
@@ -21,15 +26,6 @@ def _is_mpy(path: str) -> bool:
     except OSError:
         return False
 
-from utils.ir import stmt_repr, expr_repr
-from loader import load_code_object, _find_code_by_name
-from extract import extract_code_objects
-from utils.codegen import generate_python_code
-from disasm import parse_instructions
-from utils.cfg import build_basic_blocks, build_cfg
-from stack_sim import simulate_stack
-from patterns import detect_high_level_patterns
-from utils.ast_recover import build_recovered_ast
 
 def main():
 
@@ -71,7 +67,6 @@ def main():
 
     root = load_code_object(pyc_path)
 
-    # -------- coletar TODOS os code objects do .pyc (recursivo) --------
     seen = set()
     all_cos = []
 
@@ -100,7 +95,6 @@ def main():
 
     all_cos.sort(key=_sort_key)
 
-    # -------- helpers de impressão --------
     def print_parsed_instructions(ins):
         for x in ins:
             off = x["offset"]
@@ -181,8 +175,7 @@ def main():
         except Exception:
             print("ExceptionTable: <indisponível>")
 
-    # -------- pipeline por code object (cache por co) --------
-    cache = {}  # id(co) -> dict(stage_artifacts)
+    cache = {}  
 
     def get_artifacts(co):
         cid = id(co)
@@ -199,9 +192,6 @@ def main():
             "recovered_ast": None,
         }
 
-        # dis não precisa de artefatos
-
-        # parse
         art["ins"] = parse_instructions(co, debug=debug)
 
         # blocks
@@ -215,7 +205,6 @@ def main():
             art["blocks"], art["cfg"], art["ins"], co, debug=debug
         )
 
-        # patterns
         art["patterns"] = detect_high_level_patterns(
             blocks=art["blocks"],
             cfg=art["cfg"],
@@ -224,7 +213,6 @@ def main():
             debug=debug,
         )
 
-        # recovered_ast
         art["recovered_ast"] = build_recovered_ast(
             blocks=art["blocks"],
             cfg=art["cfg"],
@@ -237,7 +225,6 @@ def main():
         cache[cid] = art
         return art
 
-    # -------- execução por stage --------
     if stage == "gen_code":
         # gera para o bytecode inteiro (tree completo)
         print("[STAGE gen_code] gerando código para TODO o .pyc (todos os code objects)")
@@ -245,7 +232,6 @@ def main():
         print(generate_python_code(tree, debug=debug))
         return
 
-    # demais stages: imprime por code object
     for co in all_cos:
         print("\n" + "=" * 80)
         print(f"[CO] {co.co_name}  (firstlineno={getattr(co, 'co_firstlineno', None)})")
