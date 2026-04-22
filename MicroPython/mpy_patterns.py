@@ -1,16 +1,3 @@
-"""
-Detecção de padrões de alto nível para bytecode MicroPython (formato v6.x).
-
-Análogo a Decompiler/patterns.py, mas sem:
-  - dis.Bytecode(code_obj).exception_entries  (usa SETUP_* no bytecode)
-  - match/case (MicroPython não tem)
-  - padrão COPY 1 + short-circuit (usa JUMP_IF_*_OR_POP diretamente)
-  - LOAD_ASSERTION_ERROR (assert gera sequências com RAISE_OBJ)
-  - BEFORE_WITH / WITH_EXCEPT_START (usa SETUP_WITH + WITH_CLEANUP)
-
-Reutiliza utils/block_utils.py (build_block_by_id, build_offset_to_block, etc.).
-"""
-
 from utils.block_utils import (
     build_block_by_id,
     build_offset_to_block,
@@ -21,26 +8,14 @@ from utils.block_utils import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Constantes de opcodes MicroPython
-# ---------------------------------------------------------------------------
-
-# Saltos condicionais que consomem TOS
 _MPY_COND_JUMPS = frozenset({"POP_JUMP_IF_TRUE", "POP_JUMP_IF_FALSE"})
-
-# Short-circuit: jump sem pop se condição satisfeita (and/or)
 _MPY_SHORT_CIRCUIT_JUMPS = frozenset({"JUMP_IF_TRUE_OR_POP", "JUMP_IF_FALSE_OR_POP"})
-
-# Opcodes de setup de handlers de exceção/with
 _SETUP_EXCEPT_OPS  = frozenset({"SETUP_EXCEPT"})
 _SETUP_FINALLY_OPS = frozenset({"SETUP_FINALLY"})
 _SETUP_WITH_OPS    = frozenset({"SETUP_WITH"})
 _SETUP_OPS         = _SETUP_EXCEPT_OPS | _SETUP_FINALLY_OPS | _SETUP_WITH_OPS
-
-# Terminadores de bloco MicroPython
 _MPY_TERMINATORS = frozenset({"JUMP", "RETURN_VALUE", "RAISE_LAST", "RAISE_OBJ", "RAISE_FROM"})
 
-# Opcodes de infraestrutura de with (usados para expandir with_handler_blocks)
 _WITH_CLEANUP_OPS = frozenset({
     "POP_TOP", "POP_EXCEPT_JUMP", "JUMP",
     "WITH_CLEANUP", "END_FINALLY",
@@ -49,20 +24,10 @@ _WITH_CLEANUP_OPS = frozenset({
 })
 
 
-# ---------------------------------------------------------------------------
-# Helpers internos
-# ---------------------------------------------------------------------------
-
 def _is_mpy_cond_jump(opname: str) -> bool:
-    """True se o opcode é um salto condicional que consome TOS."""
     return opname in _MPY_COND_JUMPS
 
-
 def _mpy_jump_on_true(opname: str):
-    """
-    Retorna True se o salto é tomado quando a condição é verdadeira,
-    False se é tomado quando falsa, None caso contrário.
-    """
     if opname == "POP_JUMP_IF_TRUE":
         return True
     if opname == "POP_JUMP_IF_FALSE":
@@ -71,67 +36,49 @@ def _mpy_jump_on_true(opname: str):
 
 
 def _block_start(block) -> int:
-    """Retorna start_offset do bloco (ou 0 se não definido)."""
     if block is None:
         return 0
     return block.get("start_offset", 0)
 
 
 def _classify_mpy_handler(setup_op: str, handler_bid: int, block_by_id: dict) -> dict:
-    """
-    Classifica um bloco handler MicroPython com base no opcode SETUP_* que o referencia.
 
-    - SETUP_EXCEPT  → is_except=True  (except handler)
-    - SETUP_FINALLY → is_cleanup=True (finally handler)
-    - SETUP_WITH    → is_with_handler=True
-
-    Faz também verificação superficial das instruções do handler block
-    para detectar WITH_CLEANUP (confirma with handler) e POP_EXCEPT_JUMP (except real).
-    """
     handler_b = block_by_id.get(handler_bid, {})
     handler_ops = set(get_block_opnames(handler_b))
-
-    # Derivado do setup opcode
+    handler_instrs = get_block_instrs(handler_b)
     is_with_handler = (setup_op == "SETUP_WITH") or ("WITH_CLEANUP" in handler_ops)
     is_except  = (setup_op == "SETUP_EXCEPT")  and not is_with_handler
     is_cleanup = (setup_op == "SETUP_FINALLY") and not is_with_handler
+    is_exc_var_cleanup = False
+    if is_cleanup and "END_FINALLY" in handler_ops and "DELETE_FAST" in handler_ops:
+        allowed = {"LOAD_CONST_NONE", "LOAD_CONST", "STORE_FAST_MULTI", "STORE_FAST_N",
+                   "DELETE_FAST", "END_FINALLY", "NOP", "POP_EXCEPT_JUMP", "JUMP"}
+        has_store = ("STORE_FAST_MULTI" in handler_ops) or ("STORE_FAST_N" in handler_ops)
+        if handler_ops.issubset(allowed) and has_store:
+            store_var = None
+            del_var = None
+            for ins in handler_instrs:
+                if ins.get("opname") in ("STORE_FAST_MULTI", "STORE_FAST_N") and store_var is None:
+                    store_var = ins.get("argrepr") or str(ins.get("argval", ""))
+                elif ins.get("opname") == "DELETE_FAST" and del_var is None:
+                    del_var = ins.get("argrepr") or str(ins.get("argval", ""))
+            if store_var and store_var == del_var:
+                is_exc_var_cleanup = True
 
     return {
         "is_except":         is_except,
         "is_cleanup":        is_cleanup,
         "is_with_handler":   is_with_handler,
-        # Campos CPython não aplicáveis ao MicroPython v6.x
         "is_gen_cleanup":    False,
-        "is_exc_var_cleanup": False,
+        "is_exc_var_cleanup": is_exc_var_cleanup,
         "is_with_reraise":   False,
         "is_comp_restore":   False,
         "is_cleanup_throw":  False,
         "is_async_for_exit": False,
     }
 
-
-# ---------------------------------------------------------------------------
-# Detecção principal
-# ---------------------------------------------------------------------------
-
 def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
-    """
-    Detecta padrões de alto nível em bytecode MicroPython.
 
-    Retorna um dict compatível com a interface de Decompiler/patterns.py:
-        "ifs"                   — list de padrões IF (POP_JUMP_IF_*)
-        "loops"                 — list de back-edges (loops)
-        "short_circuit_candidates" — list de padrões AND/OR
-        "short_circuit_blocks"  — set de block ids que são short-circuit
-        "try_regions"           — list de regiões try/except/finally
-        "with_regions"          — list de regiões with
-        "with_handler_blocks"   — set de block ids de handlers de with
-        "assert_patterns"       — list (sempre vazia — MicroPython não usa LOAD_ASSERTION_ERROR)
-        "match_chains"          — list (sempre vazia — sem match/case)
-        "match_regions"         — list (sempre vazia)
-        "seq_match_chains"      — list (sempre vazia)
-        "comprehensions"        — list de padrões de comprehension
-    """
     if debug:
         name = getattr(code_obj, "co_name", "<?>")
         print(f"[DEBUG MPY PAT] detect_mpy_patterns: {name}")
@@ -155,13 +102,9 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
         "comprehensions":           [],
     }
 
-    # ----  Pré-processamento: coleta todos os handler blocks (alvos de SETUP_*) ----
-    # Estes blocos são excluídos da detecção de loops e IFs normais.
-
     handler_block_ids: set  = set()
     exc_related_blocks: set = set()
 
-    # Mapa: handler_bid → list de (setup_op, setup_off, setup_bid)
     _handler_setup_map: dict = {}
 
     for b in blocks:
@@ -184,8 +127,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                 "setup_bid": bid,
             })
 
-    # ---- TRY/EXCEPT e FINALLY via SETUP_EXCEPT / SETUP_FINALLY ----
-
     for b in blocks:
         bid   = b["id"]
         instrs = get_block_instrs(b)
@@ -202,7 +143,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
             if handler_bid is None:
                 continue
 
-            # Blocos protegidos: start_offset estritamente entre setup_off e handler_off
             protected = sorted(
                 blk["id"] for blk in blocks
                 if _block_start(blk) > setup_off and _block_start(blk) < handler_off
@@ -232,8 +172,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                     f"handler={handler_bid} protected={protected}"
                 )
 
-    # ---- WITH via SETUP_WITH ----
-
     with_regions: list = []
     with_handler_block_ids: set = set()
 
@@ -256,8 +194,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                 continue
 
             with_handler_block_ids.add(handler_bid)
-
-            # Busca "as var" nas instruções logo após SETUP_WITH no mesmo bloco
             as_var = None
             for next_instr in instrs[i + 1:]:
                 nop = next_instr["opname"]
@@ -270,7 +206,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                 if nop not in _SKIP_OPS_AFTER_SETUP_WITH:
                     break
 
-            # Se não encontrou no mesmo bloco, tenta bloco seguinte via CFG
             if as_var is None:
                 for succ_bid in cfg.get(bid, set()):
                     succ_b = block_by_id.get(succ_bid)
@@ -286,7 +221,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                     if as_var is not None:
                         break
 
-            # Blocos protegidos: entre SETUP_WITH e handler
             protected = sorted(
                 blk["id"] for blk in blocks
                 if _block_start(blk) > setup_off and _block_start(blk) < handler_off
@@ -307,7 +241,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                     f"as_var={as_var} handler={handler_bid} prot={protected}"
                 )
 
-    # Expande with_handler_block_ids via BFS (handlers e seus sucessores de cleanup)
     with_body_bids: set = set()
     for wr in with_regions:
         with_body_bids.update(wr.get("protected_blocks", []))
@@ -326,13 +259,8 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
     patterns["with_handler_blocks"] = with_handler_block_ids
     exc_related_blocks.update(with_handler_block_ids)
 
-    # ---- LOOP detection: back-edges no CFG (dst_start <= src_start) ----
 
     def _promote_loop_header(dst_bid: int) -> int:
-        """
-        Tenta substituir dst_bid por um bloco predecessor com salto condicional
-        que seja o cabeçalho real do loop (e.g. header de while).
-        """
         dst_start = _block_start(block_by_id.get(dst_bid))
         best = None
         for p in preds.get(dst_bid, set()):
@@ -349,7 +277,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
             succs = list(cfg.get(p, ()))
             if len(succs) != 2 or dst_bid not in succs:
                 continue
-            # Há outro successor com start >= dst_start (exit do loop)
             others = [x for x in succs if x != dst_bid]
             if not any(_block_start(block_by_id.get(o)) >= dst_start for o in others):
                 continue
@@ -359,7 +286,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
         return best[1] if best else dst_bid
 
     def _looks_like_loop_header(bid: int) -> bool:
-        """True se o bloco tem características de cabeçalho de loop."""
         ps = {
             p for p in preds.get(bid, set())
             if p not in handler_block_ids and p not in exc_related_blocks
@@ -380,20 +306,15 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
         for dst in succs:
             dst_start = _block_start(block_by_id.get(dst))
             if dst_start > src_start:
-                continue  # aresta forward — não é back-edge
+                continue 
             if src in handler_block_ids or dst in handler_block_ids:
                 continue
             if src in exc_related_blocks or dst in exc_related_blocks:
                 continue
 
-            # Promove antes de verificar: no padrão range() do MicroPython, o bloco
-            # alvo do back-edge (corpo) não tem múltiplos predecessores, mas o bloco
-            # de condição promovido (com POP_JUMP_IF_TRUE/FALSE) sim.
             promoted = _promote_loop_header(dst)
             if not _looks_like_loop_header(promoted) and not _looks_like_loop_header(dst):
                 continue
-
-            # Evita loops duplicados com mesmo (latch, header)
             loop_key = (src, promoted)
             if loop_key in seen_loops:
                 continue
@@ -409,7 +330,7 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                 "latch":         src,
                 "header_start":  _block_start(block_by_id.get(promoted)),
                 "latch_start":   src_start,
-                "is_async_for":  False,   # MicroPython v6.x não tem async for
+                "is_async_for":  False,  
                 "is_for":        is_for,
             })
 
@@ -418,8 +339,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                     f"[DEBUG MPY PAT] LOOP: latch {src} -> header {promoted} "
                     f"(body_entry={dst}, is_for={is_for})"
                 )
-
-    # ---- IF detection: POP_JUMP_IF_TRUE / POP_JUMP_IF_FALSE ----
 
     for b in blocks:
         bid    = b["id"]
@@ -431,7 +350,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
         if not op or not _is_mpy_cond_jump(op):
             continue
 
-        # Exclui arestas para handler/exception blocks
         succs = [
             s for s in cfg.get(bid, set())
             if s not in handler_block_ids and s not in exc_related_blocks
@@ -447,7 +365,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
             others     = [s for s in succs if s != jump_block]
             fall_block = others[0] if others else None
         else:
-            # jump_target não resolvido — usa offset crescente como heurística
             sorted_succs = sorted(succs, key=lambda s: _block_start(block_by_id.get(s)))
             fall_block   = sorted_succs[0]  if sorted_succs          else None
             jump_block   = sorted_succs[1]  if len(sorted_succs) > 1 else None
@@ -477,8 +394,6 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                 f"true={true_succ}, false={false_succ}"
             )
 
-    # ---- SHORT-CIRCUIT: JUMP_IF_TRUE_OR_POP / JUMP_IF_FALSE_OR_POP ----
-
     for b in blocks:
         bid    = b["id"]
         instrs = get_block_instrs(b)
@@ -498,13 +413,10 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
             others     = [s for s in succs if s != jump_block]
             fall_block = others[0] if others else None
 
-        # Marca como short-circuit blocks para ast_recover.py suprimir como if
         patterns["short_circuit_blocks"].add(bid)
         if fall_block is not None:
             patterns["short_circuit_blocks"].add(fall_block)
 
-        # JUMP_IF_FALSE_OR_POP → `and` (short-circuit em False)
-        # JUMP_IF_TRUE_OR_POP  → `or`  (short-circuit em True)
         is_and = (op == "JUMP_IF_FALSE_OR_POP")
 
         patterns["short_circuit_candidates"].append({
@@ -523,14 +435,12 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
                 f"jump={jump_block} fall={fall_block}"
             )
 
-    # ---- GENERATOR ----
 
     scope_flags  = getattr(code_obj, "scope_flags", 0)
-    is_generator = bool(scope_flags & 0x01)   # _MP_SCOPE_GENERATOR = 0x01
+    is_generator = bool(scope_flags & 0x01)   
     if is_generator and debug:
         print(f"[DEBUG MPY PAT] GENERATOR: {getattr(code_obj, 'co_name', '?')}")
 
-    # ---- COMPREHENSIONS (STORE_COMP no corpo do loop) ----
 
     loop_headers_seen: set = set()
     comprehensions: list   = []
@@ -540,17 +450,12 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
         if header_bid in loop_headers_seen:
             continue
 
-        # Coleta block ids do corpo do loop (latch + body_entry de todos os back-edges
-        # com mesmo header)
         body_bids: set = set()
         for other_lp in patterns["loops"]:
             if other_lp["header"] == header_bid:
                 body_bids.add(other_lp["latch"])
                 body_bids.add(other_lp.get("body_entry", -1))
 
-        # MicroPython usa STORE_COMP para acumular itens em comprehensions.
-        # A instrução STORE_COMP n guarda TOS no acumulador na posição -(n+1) da pilha.
-        # Qualquer STORE_COMP no corpo indica uma comprehension.
         has_store_comp = any(
             ins["opname"] == "STORE_COMP"
             for bid in body_bids
@@ -560,7 +465,7 @@ def detect_mpy_patterns(blocks, cfg, stack_info, code_obj, debug=False):
         if has_store_comp:
             loop_headers_seen.add(header_bid)
             comprehensions.append({
-                "type":      "comprehension",   # tipo específico não distinguível sem análise profunda
+                "type":      "comprehension",  
                 "header":    header_bid,
                 "loop_info": lp,
             })
