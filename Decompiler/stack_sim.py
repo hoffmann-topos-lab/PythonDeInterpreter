@@ -94,7 +94,7 @@ def simulate_stack(blocks, cfg, instructions, code_obj, debug=True, max_iters=20
 
             ops_in_block = {ins["opname"] for ins in block.get("instructions", [])}
 
-            # --- materialização controlada de return ---
+
             ret_expr = None
             for v in cur_stack[::-1]:
                 if isinstance(v, Expr) and v.kind == "return_value":
@@ -105,21 +105,13 @@ def simulate_stack(blocks, cfg, instructions, code_obj, debug=True, max_iters=20
                 is_loop_cleanup = block.get("loop_after") is not None
                 val = ret_expr.args[0] if ret_expr.args else None
 
-                # Normaliza detecção de None (Expr(const None) ou None)
                 is_none = (
                     val is None
                     or (isinstance(val, Expr) and val.kind == "const" and val.value is None)
                 )
 
-                # Heurística: se o bloco já tem statements "reais" (ex.: print),
-                # então esse RETURN_CONST None é muito provavelmente epílogo/cleanup (ex.: finally),
-                # e NÃO deve virar "return None" no pseudo-código.
                 has_real_stmt = any(s.kind not in ("del",) for s in stmts)
 
-                # Regras:
-                # - return com valor: materializa sempre (fora de cleanup de loop)
-                # - return None: materializa apenas se NÃO houver statements reais no bloco
-                #   (evita colar return None em finally)
                 if not is_loop_cleanup:
                     if not is_none:
                         stmts.append(Stmt(kind="return", expr=val, origins=ret_expr.origins))
@@ -127,7 +119,6 @@ def simulate_stack(blocks, cfg, instructions, code_obj, debug=True, max_iters=20
                         if not has_real_stmt:
                             stmts.append(Stmt(kind="return", expr=val, origins=ret_expr.origins))
 
-                # remove todos os marcadores
                 cur_stack = [
                     v for v in cur_stack
                     if not (isinstance(v, Expr) and v.kind == "return_value")
@@ -156,13 +147,9 @@ def simulate_stack(blocks, cfg, instructions, code_obj, debug=True, max_iters=20
     if debug:
         print("[DEBUG] Simulação de pilha finalizada")
 
-    # ---- Pós-processamento: short-circuit and/or ----
     _fix_short_circuit(blocks, cfg, block_statements, block_conditions, in_stack, out_stack, debug=debug)
-
-    # ---- Pós-processamento: comprehensions inlined (PEP 709) ----
     _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stack, out_stack, debug=debug)
-
-    # ---- Pós-processamento: yield from (GET_YIELD_FROM_ITER + SEND loop) ----
+    ternary_ancestors = _fix_ternary_phi(blocks, cfg, block_statements, block_conditions, in_stack, out_stack, debug=debug)
     yield_from_blocks = _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=debug)
 
     return {
@@ -173,13 +160,49 @@ def simulate_stack(blocks, cfg, instructions, code_obj, debug=True, max_iters=20
         "block_statements": block_statements,
         "block_conditions": block_conditions,
         "yield_from_blocks": yield_from_blocks,
+        "ternary_ancestors": ternary_ancestors,
     }
 
 def _fix_short_circuit(blocks, cfg, block_statements, block_conditions, in_stack, out_stack, debug=False):
-    """Substitui phi(a,b) por binop(and/or) quando vem de short-circuit."""
     block_by_id = build_block_by_id(blocks)
     offset_to_block = build_offset_to_block(blocks)
 
+    def _subst_expr(e, old_obj, new_expr):
+        if e is None or not isinstance(e, Expr):
+            return e
+        if e is old_obj:
+            return new_expr
+        if not e.args:
+            return e
+        new_args = tuple(_subst_expr(a, old_obj, new_expr) for a in e.args)
+        if any(na is not e.args[i] for i, na in enumerate(new_args)):
+            return Expr(kind=e.kind, value=e.value, args=new_args, origins=e.origins)
+        return e
+
+    def _subst_stmt(s, old_obj, new_expr):
+        if not isinstance(s, Stmt):
+            return s
+        new_e = _subst_expr(s.expr, old_obj, new_expr) if s.expr is not None else s.expr
+        new_x = _subst_expr(s.extra, old_obj, new_expr) if isinstance(s.extra, Expr) else s.extra
+        if new_e is s.expr and new_x is s.extra:
+            return s
+        return Stmt(kind=s.kind, target=s.target, expr=new_e, extra=new_x, origins=s.origins)
+
+    def _subst_everywhere(old_obj, new_expr, skip_bid=None):
+        for bid2 in list(in_stack.keys()):
+            if bid2 == skip_bid:
+                continue
+            in_stack[bid2] = [_subst_expr(v, old_obj, new_expr) for v in in_stack[bid2]]
+        for bid2 in list(out_stack.keys()):
+            if bid2 == skip_bid:
+                continue
+            out_stack[bid2] = [_subst_expr(v, old_obj, new_expr) for v in out_stack[bid2]]
+        for bid2 in list(block_statements.keys()):
+            block_statements[bid2] = [_subst_stmt(s, old_obj, new_expr) for s in (block_statements[bid2] or [])]
+        for bid2 in list(block_conditions.keys()):
+            block_conditions[bid2] = [_subst_expr(v, old_obj, new_expr) for v in (block_conditions[bid2] or [])]
+
+    sc_items = [] 
     for b in blocks:
         bid = b["id"]
         instrs = b.get("instructions", []) or []
@@ -190,20 +213,17 @@ def _fix_short_circuit(blocks, cfg, block_statements, block_conditions, in_stack
         op_last = last.get("opname", "")
         op_prev = prev.get("opname", "")
 
-        # Precisa terminar com COPY(1) + POP_JUMP_IF_*
         if not (op_last.startswith("POP_JUMP") and "IF_" in op_last):
             continue
         if op_prev != "COPY" or prev.get("arg") != 1:
             continue
 
-        is_and = "IF_FALSE" in op_last  # salta quando false → and
-        is_or = "IF_TRUE" in op_last    # salta quando true  → or
+        is_and = "IF_FALSE" in op_last
+        is_or = "IF_TRUE" in op_last
         if not (is_and or is_or):
             continue
-
         op = "and" if is_and else "or"
 
-        # Identifica bloco jump-target e fall-through
         jump_off = last.get("jump_target")
         jump_bid = offset_to_block.get(jump_off) if jump_off is not None else None
 
@@ -212,64 +232,97 @@ def _fix_short_circuit(blocks, cfg, block_statements, block_conditions, in_stack
         if fall_bid is None:
             continue
 
-        # Fall-through deve começar com POP_TOP
         fall_b = block_by_id.get(fall_bid, {})
         fall_instrs = fall_b.get("instructions", []) or []
         if not fall_instrs or fall_instrs[0].get("opname") != "POP_TOP":
             continue
 
-        # Valor 'a' = topo do out_stack do bloco sc (o original que ficou na pilha)
-        a_stack = out_stack.get(bid, [])
-        b_stack = out_stack.get(fall_bid, [])
-        if not a_stack or not b_stack:
-            continue
-        a_val = a_stack[-1]
-        b_val = b_stack[-1]
-        if a_val is None or b_val is None:
-            continue
-
-        # Constrói expressão and/or
-        sc_expr = Expr(kind="binop", value=op, args=(a_val, b_val), origins=frozenset())
-
-        # Blocos de merge = interseção dos sucessores de fall_bid e jump_bid
         fall_succs = set(cfg.get(fall_bid, set()))
         sc_succs = set(cfg.get(bid, set()))
-        # O bloco de merge pode ser jump_bid (se o resultado fica em jump_bid)
-        # ou pode ser um bloco posterior. Verifica onde o phi aparece.
         candidates = fall_succs | (sc_succs - {fall_bid})
 
-        def _replace_phi_in_stack(stk, old_a, old_b, new_expr):
-            """Substitui o primeiro phi que contenha old_a ou old_b pelo new_expr."""
-            changed = False
-            new_stk = list(stk)
-            for i, v in enumerate(new_stk):
+        primary_merge = jump_bid if jump_bid is not None else 10**9
+        sc_items.append((bid, op, jump_bid, fall_bid, primary_merge, candidates))
+
+    sc_items.sort(key=lambda t: (t[4], -t[0]))
+
+    def _replace_phi_in_stack(stk, old_a, old_b, new_expr):
+        new_stk = list(stk)
+        a_repr = expr_repr(old_a)
+        b_repr = expr_repr(old_b)
+        for i, v in enumerate(new_stk):
+            if not (isinstance(v, Expr) and v.kind == "phi"):
+                continue
+            phi_args = v.args or ()
+            phi_reprs = [expr_repr(x) for x in phi_args]
+            a_matched = a_repr in phi_reprs
+            b_matched = b_repr in phi_reprs
+
+            if len(phi_args) <= 2:
+                if a_matched or b_matched:
+                    new_stk[i] = new_expr
+                    return new_stk, True, v
+                continue
+            if a_matched and b_matched:
+                remaining = tuple(
+                    x for x, xr in zip(phi_args, phi_reprs)
+                    if xr != a_repr and xr != b_repr
+                )
+                new_args = (new_expr,) + remaining
+                if len(new_args) == 1:
+                    new_stk[i] = new_args[0]
+                else:
+                    new_stk[i] = Expr(kind="phi", value=v.value, args=new_args, origins=v.origins)
+                return new_stk, True, v
+        return new_stk, False, None
+
+    for bid, op, jump_bid, fall_bid, primary_merge, candidates in sc_items:
+        a_stack = out_stack.get(bid, [])
+        b_stack = out_stack.get(fall_bid, [])
+        if not a_stack:
+            continue
+        a_val = a_stack[-1]
+        b_val_default = b_stack[-1] if b_stack else None
+        if b_val_default is None:
+            for s in reversed(block_statements.get(fall_bid, []) or []):
+                if isinstance(s, Stmt) and s.kind == "return" and s.expr is not None:
+                    b_val_default = s.expr
+                    break
+        if a_val is None or b_val_default is None:
+            continue
+
+        patched_any = False
+        for merge_bid in candidates:
+            merge_in = in_stack.get(merge_bid, [])
+
+            b_val = b_val_default
+            for v in merge_in:
                 if not (isinstance(v, Expr) and v.kind == "phi"):
                     continue
                 phi_args = v.args or ()
-                # Compara por repr para evitar problemas de identidade de objetos
-                a_repr = expr_repr(old_a)
-                b_repr = expr_repr(old_b)
-                phi_reprs = {expr_repr(x) for x in phi_args}
-                if a_repr in phi_reprs or b_repr in phi_reprs:
-                    new_stk[i] = new_expr
-                    changed = True
-                    break
-            return new_stk, changed
+                a_repr_tmp = expr_repr(a_val)
+                phi_reprs = [expr_repr(x) for x in phi_args]
+                if a_repr_tmp in phi_reprs:
+                    others = [phi_args[i] for i, r in enumerate(phi_reprs) if r != a_repr_tmp]
+                    if len(others) == 1:
+                        b_val = others[0]
+                break
 
-        for merge_bid in candidates:
-            merge_in = in_stack.get(merge_bid, [])
-            new_merge, patched = _replace_phi_in_stack(merge_in, a_val, b_val, sc_expr)
+            sc_expr = Expr(kind="binop", value=op, args=(a_val, b_val), origins=frozenset())
+
+            new_merge, patched, old_phi_obj = _replace_phi_in_stack(
+                merge_in, a_val, b_val, sc_expr
+            )
             if not patched:
                 continue
             in_stack[merge_bid] = new_merge
-            # Re-simula o bloco de merge para atualizar block_statements e out_stack
+
             merge_b = block_by_id.get(merge_bid, {})
             new_stmts = []
             new_conds = []
             cur_stk = list(new_merge)
             for instr in merge_b.get("instructions", []) or []:
                 simulate_instruction(instr, cur_stk, new_stmts, new_conds, debug=False)
-            # Materializa return_value (como faz o loop principal de fixpoint)
             ret_expr = None
             for v in cur_stk[::-1]:
                 if isinstance(v, Expr) and v.kind == "return_value":
@@ -284,14 +337,48 @@ def _fix_short_circuit(blocks, cfg, block_statements, block_conditions, in_stack
                     new_stmts.append(Stmt(kind="return", expr=val, origins=ret_expr.origins))
             block_statements[merge_bid] = new_stmts
             block_conditions[merge_bid] = new_conds
-            # Atualiza out_stack para que blocos subsequentes vejam o valor corrigido
             out_stack[merge_bid] = [v for v in cur_stk if not (isinstance(v, Expr) and v.kind == "return_value")]
+
+            if old_phi_obj is not None:
+                _subst_everywhere(old_phi_obj, sc_expr, skip_bid=merge_bid)
+
+            fall_stmts_list = block_statements.get(fall_bid, []) or []
+            if fall_stmts_list:
+                first = fall_stmts_list[0]
+                if (isinstance(first, Stmt) and first.kind == "expr"
+                        and isinstance(first.expr, Expr)
+                        and first.expr.kind in ("phi", "binop")):
+                    block_statements[fall_bid] = fall_stmts_list[1:]
+
+            patched_any = True
             if debug:
                 print(f"[DEBUG] short-circuit {op}: patched phi em bloco {merge_bid}")
 
+        if not patched_any and jump_bid is not None:
+            jump_stmts = block_statements.get(jump_bid, []) or []
+            fall_stmts = block_statements.get(fall_bid, []) or []
+            def _last_return(stmts_list):
+                for s in reversed(stmts_list):
+                    if isinstance(s, Stmt) and s.kind == "return":
+                        return s
+                return None
+            jump_ret = _last_return(jump_stmts)
+            fall_ret = _last_return(fall_stmts)
+            if jump_ret is not None and fall_ret is not None:
+                a_repr = expr_repr(a_val)
+                b_repr = expr_repr(b_val_default)
+                jump_ret_repr = expr_repr(jump_ret.expr) if jump_ret.expr is not None else ""
+                fall_ret_repr = expr_repr(fall_ret.expr) if fall_ret.expr is not None else ""
+                if jump_ret_repr == a_repr and fall_ret_repr == b_repr:
+                    sc_expr = Expr(kind="binop", value=op, args=(a_val, b_val_default), origins=frozenset())
+                    new_ret = Stmt(kind="return", expr=sc_expr, origins=jump_ret.origins)
+                    new_jump_stmts = [s for s in jump_stmts if s is not jump_ret] + [new_ret]
+                    block_statements[jump_bid] = new_jump_stmts
+                    if debug:
+                        print(f"[DEBUG] short-circuit {op}: combined returns de jump={jump_bid} e fall={fall_bid}")
+
 
 def _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stack, out_stack, debug=False):
-    """Detecta comprehensions inlined (PEP 709) e substitui phi do acumulador por list_comp/set_comp."""
     block_by_id = build_block_by_id(blocks)
     offset_to_block = build_offset_to_block(blocks)
     succs = {bid: set(cfg.get(bid, set())) for bid in block_by_id}
@@ -300,102 +387,214 @@ def _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stac
     def block_opnames(bid):
         return get_block_opnames(block_by_id.get(bid, {}))
 
-    # Busca blocos com LOAD_FAST_AND_CLEAR (início de comprehension inlined)
-    for b in blocks:
-        bid = b["id"]
-        ops = block_opnames(bid)
-        if "LOAD_FAST_AND_CLEAR" not in ops:
-            continue
+    def _subst_expr(e, pred, replacement):
+        if not isinstance(e, Expr):
+            return e
+        if pred(e):
+            return replacement
+        if not e.args:
+            return e
+        new_args = tuple(_subst_expr(a, pred, replacement) for a in e.args)
+        if any(na is not e.args[i] for i, na in enumerate(new_args)):
+            return Expr(kind=e.kind, value=e.value, args=new_args, origins=e.origins)
+        return e
 
-        instrs = b.get("instructions", []) or []
-        # Extrai a(s) variável(is) salvas (LOAD_FAST_AND_CLEAR args)
-        lfc_vars = []
-        for ins in instrs:
-            if ins["opname"] == "LOAD_FAST_AND_CLEAR":
-                v = ins.get("argval") or ins.get("argrepr")
-                if v:
-                    lfc_vars.append(v)
-        lfc_var = lfc_vars[0] if lfc_vars else None
-        if lfc_var is None:
-            continue
+    def _subst_stmt(s, pred, replacement):
+        if not isinstance(s, Stmt):
+            return s
+        new_e = _subst_expr(s.expr, pred, replacement) if s.expr is not None else s.expr
+        new_x = _subst_expr(s.extra, pred, replacement) if isinstance(s.extra, Expr) else s.extra
+        if new_e is s.expr and new_x is s.extra:
+            return s
+        return Stmt(kind=s.kind, target=s.target, expr=new_e, extra=new_x, origins=s.origins)
 
-        # Encontra o bloco com BUILD_LIST/BUILD_SET/BUILD_MAP e o loop header (FOR_ITER)
-        # Percorre o CFG a partir do bloco atual
-        def find_comp_structure(start_bid, visited_bids=None):
-            """Retorna (build_bid, header_bid, body_bid, comp_kind) ou None."""
-            if visited_bids is None:
-                visited_bids = set()
-            if start_bid in visited_bids or len(visited_bids) > 10:
-                return None
-            visited_bids.add(start_bid)
-            ops_here = set(block_opnames(start_bid))
-            if "FOR_ITER" in ops_here:
-                return None  # já passou do ponto de busca
-            # Verifica se tem BUILD_LIST/SET/MAP
-            build_kind = None
-            if "BUILD_LIST" in ops_here:
-                build_kind = "list"
-            elif "BUILD_SET" in ops_here:
-                build_kind = "set"
-            elif "BUILD_MAP" in ops_here:
-                build_kind = "dict"
-            for succ in succs.get(start_bid, set()):
-                succ_ops = set(block_opnames(succ))
-                if "FOR_ITER" in succ_ops:
-                    # Encontrou o loop header
-                    # Procura o corpo (body block com LIST_APPEND/SET_ADD/MAP_ADD)
-                    for body_bid in succs.get(succ, set()):
-                        body_ops = set(block_opnames(body_bid))
-                        if "LIST_APPEND" in body_ops:
-                            return (start_bid, succ, body_bid, "list")
-                        if "SET_ADD" in body_ops:
-                            return (start_bid, succ, body_bid, "set")
-                        if "MAP_ADD" in body_ops:
-                            return (start_bid, succ, body_bid, "dict")
-                else:
-                    result = find_comp_structure(succ, visited_bids)
-                    if result:
-                        return result
+    def _subst_everywhere(pred, replacement):
+        for bid2 in list(in_stack.keys()):
+            in_stack[bid2] = [_subst_expr(v, pred, replacement) for v in in_stack[bid2]]
+        for bid2 in list(out_stack.keys()):
+            out_stack[bid2] = [_subst_expr(v, pred, replacement) for v in out_stack[bid2]]
+        for bid2 in list(block_statements.keys()):
+            block_statements[bid2] = [_subst_stmt(s, pred, replacement) for s in (block_statements[bid2] or [])]
+        for bid2 in list(block_conditions.keys()):
+            block_conditions[bid2] = [_subst_expr(v, pred, replacement) for v in (block_conditions[bid2] or [])]
+
+    def _is_leaf_accum(e, kind, elem_reprs):
+
+        if not isinstance(e, Expr):
+            return False
+        if e.kind == "list":
+            if kind != "list":
+                return False
+            if not e.args:
+                return True
+            return all(expr_repr(a) == elem_reprs[0] for a in e.args)
+        if e.kind == "set":
+            if kind != "set":
+                return False
+            if not e.args:
+                return True
+            return all(expr_repr(a) == elem_reprs[0] for a in e.args)
+        if e.kind == "dict":
+            if kind != "dict":
+                return False
+            if not e.args:
+                return True
+            if len(e.args) % 2 != 0:
+                return False
+            for i in range(0, len(e.args), 2):
+                if (expr_repr(e.args[i]) != elem_reprs[0]
+                        or expr_repr(e.args[i + 1]) != elem_reprs[1]):
+                    return False
+            return True
+        append_kinds = {"list": "list_append", "set": "set_add", "dict": "map_add"}
+        want = append_kinds[kind]
+        if e.kind == want:
+            if kind == "dict":
+                if len(e.args) < 3:
+                    return False
+                if not _is_leaf_accum(e.args[0], kind, elem_reprs):
+                    return False
+                return (expr_repr(e.args[1]) == elem_reprs[0]
+                        and expr_repr(e.args[2]) == elem_reprs[1])
+            if len(e.args) < 2:
+                return False
+            if not _is_leaf_accum(e.args[0], kind, elem_reprs):
+                return False
+            return expr_repr(e.args[1]) == elem_reprs[0]
+        if e.kind == "phi":
+            args = e.args or ()
+            if not args:
+                return False
+            return all(_is_leaf_accum(a, kind, elem_reprs) for a in args)
+        return False
+
+    def _find_append_by_jumpback(header_bid):
+        header_offset = block_by_id.get(header_bid, {}).get("start_offset")
+        if header_offset is None:
             return None
+        append_map = {"LIST_APPEND": "list", "SET_ADD": "set", "MAP_ADD": "dict"}
+        for b2 in blocks:
+            instrs2 = b2.get("instructions", []) or []
+            has_append = None
+            has_jumpback = False
+            for ins in instrs2:
+                on = ins["opname"]
+                if on in append_map:
+                    has_append = append_map[on]
+                if on in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
+                    if ins.get("argval") == header_offset:
+                        has_jumpback = True
+            if has_append and has_jumpback:
+                return (b2["id"], has_append)
+        return None
 
-        comp_struct = find_comp_structure(bid)
-        if comp_struct is None:
-            continue
+    HEADER_OPS = {"FOR_ITER", "GET_ANEXT"}
 
-        build_bid, header_bid, body_bid, comp_kind = comp_struct
+    def _collect_candidates():
+        candidates = []
+        for b in blocks:
+            bid = b["id"]
+            ops = block_opnames(bid)
+            if "LOAD_FAST_AND_CLEAR" not in ops:
+                continue
+            lfc_vars = []
+            for ins in b.get("instructions", []) or []:
+                if ins["opname"] == "LOAD_FAST_AND_CLEAR":
+                    v = ins.get("argval") or ins.get("argrepr")
+                    if v:
+                        lfc_vars.append(v)
+            if not lfc_vars:
+                continue
+            from collections import deque
+            q = deque([bid])
+            seen = {bid}
+            build_bid = None
+            build_kind = None
+            header_bid = None
+            while q:
+                cur = q.popleft()
+                cur_ops = set(block_opnames(cur))
+                if build_bid is None:
+                    if "BUILD_LIST" in cur_ops:
+                        build_bid = cur
+                        build_kind = "list"
+                    elif "BUILD_SET" in cur_ops:
+                        build_bid = cur
+                        build_kind = "set"
+                    elif "BUILD_MAP" in cur_ops:
+                        build_bid = cur
+                        build_kind = "dict"
+                if build_bid is not None:
+                    for op in HEADER_OPS:
+                        if op in cur_ops:
+                            header_bid = cur
+                            break
+                if header_bid is not None:
+                    break
+                for s in succs.get(cur, set()):
+                    if s not in seen:
+                        seen.add(s)
+                        q.append(s)
+            if build_bid is None or header_bid is None:
+                continue
+            is_async = "GET_ANEXT" in set(block_opnames(header_bid))
+            ab = _find_append_by_jumpback(header_bid)
+            if ab is None:
+                continue
+            body_bid, comp_kind = ab
+            candidates.append({
+                "lfc_bid": bid,
+                "lfc_vars": lfc_vars,
+                "build_bid": build_bid,
+                "header_bid": header_bid,
+                "body_bid": body_bid,
+                "kind": comp_kind,
+                "is_async": is_async,
+            })
+        return candidates
+
+    candidates = _collect_candidates()
+    candidates.sort(key=lambda c: -block_by_id.get(c["header_bid"], {}).get("start_offset", 0))
+
+    for cand in candidates:
+        bid = cand["lfc_bid"]
+        lfc_vars = cand["lfc_vars"]
+        lfc_var = lfc_vars[0]
+        build_bid = cand["build_bid"]
+        header_bid = cand["header_bid"]
+        body_bid = cand["body_bid"]
+        comp_kind = cand["kind"]
+        is_async = cand["is_async"]
 
         if debug:
-            print(f"[DEBUG] comprehension: lfc_var={lfc_var} build={build_bid} header={header_bid} body={body_bid} kind={comp_kind}")
+            print(f"[DEBUG] comprehension: lfc_var={lfc_var} build={build_bid} header={header_bid} body={body_bid} kind={comp_kind} async={is_async}")
 
-        # Extrai o elemento sendo acumulado do body block
         body_instrs = block_by_id.get(body_bid, {}).get("instructions", []) or []
         append_ops = {"list": "LIST_APPEND", "set": "SET_ADD", "dict": "MAP_ADD"}
         append_op = append_ops[comp_kind]
 
-        # Re-simula o body block para obter o elemento antes do LIST_APPEND
         body_in = in_stack.get(body_bid, [])
         cur_stk = list(body_in)
         stmts_tmp = []
         conds_tmp = []
         comp_element = None
         comp_cond = None
-        comp_key = None   # dict_comp: chave
-        comp_val = None   # dict_comp: valor
+        comp_key = None  
+        comp_val = None   
 
         for ins in body_instrs:
             op = ins["opname"]
             if op == append_op:
                 if comp_kind == "dict":
-                    # MAP_ADD: cur_stk[-2]=key, cur_stk[-1]=value
+                  
                     if len(cur_stk) >= 2:
                         k_e = cur_stk[-2]
                         v_e = cur_stk[-1]
                         if isinstance(k_e, Expr) and isinstance(v_e, Expr):
                             comp_key = k_e
                             comp_val = v_e
-                            comp_element = comp_key  # sentinel para o check abaixo
+                            comp_element = comp_key 
                 else:
-                    # Elemento é o topo da pilha
                     if cur_stk:
                         comp_element = cur_stk[-1]
                         if not isinstance(comp_element, Expr):
@@ -406,8 +605,7 @@ def _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stac
         if comp_element is None:
             continue
 
-        # Extrai a condição de filtro (ex: for x in items if x > 0)
-        # Blocos de corpo SEM LIST_APPEND mas com COND (POP_JUMP_IF_*)
+        comp_filter_bid = None
         for filter_bid in succs.get(header_bid, set()):
             if filter_bid == body_bid:
                 continue
@@ -416,44 +614,134 @@ def _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stac
                 filter_conds = block_conditions.get(filter_bid, [])
                 if filter_conds:
                     comp_cond = filter_conds[0]
+                    comp_filter_bid = filter_bid
                     break
 
-        # Extrai o iterável: in_stack do header_bid deve ter iter(iterable) no topo
+        if comp_cond is not None and comp_filter_bid is not None:
+            fstmts = block_statements.get(comp_filter_bid, []) or []
+            walrus_assigns = []
+            for _fst in fstmts:
+                if (isinstance(_fst, Stmt) and _fst.kind == "assign"
+                        and _fst.target and isinstance(_fst.expr, Expr)):
+                    walrus_assigns.append((_fst.target, _fst.expr))
+            if walrus_assigns:
+                def _subst_walrus(e, target, inner):
+                    if not isinstance(e, Expr):
+                        return e, False
+                    if e is inner:
+                        return Expr(kind="walrus", value=target,
+                                    args=(inner,), origins=frozenset()), True
+                    if not e.args:
+                        return e, False
+                    new_args = []
+                    changed = False
+                    for ch in e.args:
+                        new_ch, ch_changed = _subst_walrus(ch, target, inner)
+                        new_args.append(new_ch)
+                        changed = changed or ch_changed
+                    if changed:
+                        return Expr(kind=e.kind, value=e.value,
+                                    args=tuple(new_args), origins=e.origins), True
+                    return e, False
+                for _tgt, _inner in walrus_assigns:
+                    new_cond, did_subst = _subst_walrus(comp_cond, _tgt, _inner)
+                    if did_subst:
+                        comp_cond = new_cond
+
         header_in = in_stack.get(header_bid, [])
         iterable_expr = None
+        want_iter_kinds = {"aiter"} if is_async else {"iter"}
         for v in reversed(header_in):
-            if isinstance(v, Expr) and v.kind == "iter":
+            if isinstance(v, Expr) and v.kind in want_iter_kinds:
                 iterable_expr = v.args[0] if v.args else v
                 break
         if iterable_expr is None:
             continue
 
-        # Cria o Expr de comprehension
+
+        def _extract_loop_vars_from_header(hdr_bid, inner_body_bid):
+            hdr_succs = list(succs.get(hdr_bid, set()))
+            hdr_succs.sort(key=lambda b: block_by_id.get(b, {}).get("start_offset", 0))
+            store_vars = []
+            had_unpack = False
+            for cur in hdr_succs:
+                if cur == hdr_bid:
+                    continue
+                cur_instrs = block_by_id.get(cur, {}).get("instructions", []) or []
+                first_real = next((ins["opname"] for ins in cur_instrs), None)
+                if first_real in ("END_FOR", "END_ASYNC_FOR", "SWAP", "POP_TOP"):
+                    continue
+                local_stores = []
+                local_unpack = False
+                for ins in cur_instrs:
+                    on = ins["opname"]
+                    if on == "UNPACK_SEQUENCE":
+                        local_unpack = True
+                    elif on == "STORE_FAST":
+                        v = ins.get("argval") or ins.get("argrepr")
+                        if v:
+                            local_stores.append(v)
+                    elif on in ("LOAD_FAST", "LOAD_CONST", "LOAD_GLOBAL", "LOAD_DEREF",
+                                "LOAD_ATTR", "COMPARE_OP", "CALL", "BINARY_OP", "BINARY_SUBSCR",
+                                append_op, "POP_JUMP_IF_TRUE", "POP_JUMP_IF_FALSE",
+                                "END_FOR", "END_ASYNC_FOR", "SWAP"):
+                        break
+                if local_stores:
+                    store_vars = local_stores
+                    had_unpack = local_unpack
+                    break
+            return store_vars, had_unpack
+
+        store_vars, had_unpack = _extract_loop_vars_from_header(header_bid, body_bid)
+        if store_vars:
+            if had_unpack and len(store_vars) >= 2:
+                loop_var_str = ", ".join(store_vars)
+            elif len(store_vars) == 1:
+                loop_var_str = store_vars[0]
+            else:
+                loop_var_str = ", ".join(store_vars)
+        else:
+            loop_var_str = ", ".join(lfc_vars) if len(lfc_vars) >= 2 else lfc_var
+
+
+        lv_for_comp = ("async " + loop_var_str) if is_async else loop_var_str
         if comp_kind == "list":
             comp_args = (comp_element, iterable_expr) if comp_cond is None else (comp_element, iterable_expr, comp_cond)
-            comp_expr = Expr(kind="list_comp", value=lfc_var, args=comp_args, origins=frozenset())
+            comp_expr = Expr(kind="list_comp", value=lv_for_comp, args=comp_args, origins=frozenset())
         elif comp_kind == "set":
             comp_args = (comp_element, iterable_expr) if comp_cond is None else (comp_element, iterable_expr, comp_cond)
-            comp_expr = Expr(kind="set_comp", value=lfc_var, args=comp_args, origins=frozenset())
-        else:  # dict_comp
+            comp_expr = Expr(kind="set_comp", value=lv_for_comp, args=comp_args, origins=frozenset())
+        else: 
             if comp_key is None or comp_val is None:
                 continue
-            # Loop var: "k, v" para tuple unpacking (múltiplos LOAD_FAST_AND_CLEAR)
-            lv = ", ".join(lfc_vars) if len(lfc_vars) >= 2 else lfc_var
+            lv = ("async " + loop_var_str) if is_async else loop_var_str
             comp_args = (comp_key, comp_val, iterable_expr) if comp_cond is None else (comp_key, comp_val, iterable_expr, comp_cond)
             comp_expr = Expr(kind="dict_comp", value=lv, args=comp_args, origins=frozenset())
 
-        # Encontra o bloco APÓS o loop (exit do FOR_ITER)
-        # Exit = successor do header que não é o body
+        exit_end_ops = {"END_ASYNC_FOR"} if is_async else {"END_FOR"}
         exit_bid = None
         for s in succs.get(header_bid, set()):
-            body_ops_set = set(block_opnames(s))
-            if "JUMP_BACKWARD" not in body_ops_set and "JUMP_BACKWARD_NO_INTERRUPT" not in body_ops_set:
-                # Verifica se não é o loop body
-                if s != body_bid:
-                    exit_bid = s
+            if s == body_bid:
+                continue
+            s_ops = set(block_opnames(s))
+            if s_ops & exit_end_ops:
+                exit_bid = s
+                break
+        if exit_bid is None:
+            for b2 in blocks:
+                ops2 = set(get_block_opnames(b2))
+                if ops2 & exit_end_ops:
+                    exit_bid = b2["id"]
                     break
-        # Se não encontrou, tenta o successor do header que não é body
+        if exit_bid is None:
+            for s in succs.get(header_bid, set()):
+                if s == body_bid:
+                    continue
+                s_ops = set(block_opnames(s))
+                if "RERAISE" in s_ops or "JUMP_BACKWARD" in s_ops:
+                    continue
+                exit_bid = s
+                break
         if exit_bid is None:
             for s in succs.get(header_bid, set()):
                 if s != body_bid:
@@ -462,41 +750,48 @@ def _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stac
 
         if debug:
             print(f"[DEBUG] comprehension exit_bid={exit_bid}")
-
-        # Procura o bloco onde result = phi(accumulator) é armazenado
-        # É o bloco após exit_bid ou o próprio exit_bid
         result_bid = exit_bid
         result_target = None
         search_bids = [exit_bid] if exit_bid is not None else []
-        # Também verifica o successor do exit_bid
         if exit_bid is not None:
             for s in succs.get(exit_bid, set()):
-                search_bids.append(s)
+                s_ops = set(block_opnames(s))
+                if "RERAISE" not in s_ops:
+                    search_bids.append(s)
+            for s in succs.get(exit_bid, set()):
+                s_ops = set(block_opnames(s))
+                if "RERAISE" in s_ops:
+                    search_bids.append(s)
 
+        def _is_accum_phi(expr):
+            if not isinstance(expr, Expr) or expr.kind != "phi":
+                return False
+            phi_args = expr.args or ()
+            for pa in phi_args:
+                if isinstance(pa, Expr) and pa.kind in ("list", "list_append", "set", "set_add", "dict", "map_add"):
+                    return True
+                if isinstance(pa, Expr) and pa.kind == "phi":
+                    return True
+            return len(phi_args) >= 2
+
+        result_kind = None  
         for sb in search_bids:
             if sb is None:
                 continue
             stmts_here = block_statements.get(sb, [])
             for st in stmts_here:
-                if not (isinstance(st, Stmt) and st.kind == "assign"):
+                if not isinstance(st, Stmt):
                     continue
                 if not isinstance(st.expr, Expr):
                     continue
-                if st.expr.kind != "phi":
-                    continue
-                # Verifica se este phi representa o acumulador (contém list/list_append/set etc.)
-                phi_args = st.expr.args or ()
-                has_accum = False
-                for pa in phi_args:
-                    if isinstance(pa, Expr) and pa.kind in ("list", "list_append", "set", "set_add", "dict", "map_add"):
-                        has_accum = True
-                        break
-                    # Também verifica phi aninhado com <cycle>
-                    if isinstance(pa, Expr) and pa.kind == "phi":
-                        has_accum = True
-                        break
-                if has_accum or len(phi_args) >= 2:
+                if st.kind == "assign" and _is_accum_phi(st.expr):
                     result_target = st.target
+                    result_kind = "assign"
+                    result_bid = sb
+                    break
+                if st.kind == "return" and _is_accum_phi(st.expr):
+                    result_target = "__return__"
+                    result_kind = "return"
                     result_bid = sb
                     break
             if result_target:
@@ -507,17 +802,21 @@ def _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stac
                 print(f"[DEBUG] comprehension: não encontrou result_target")
             continue
 
-        # Substitui o stmt "result = phi(...)" por "result = list_comp_expr" no result_bid
         old_stmts = block_statements.get(result_bid, [])
         new_stmts = []
         patched = False
         for st in old_stmts:
-            if (not patched and isinstance(st, Stmt) and st.kind == "assign"
-                    and st.target == result_target
-                    and isinstance(st.expr, Expr) and st.expr.kind == "phi"):
-                new_stmts.append(Stmt(kind="assign", target=result_target, expr=comp_expr,
-                                      origins=st.origins))
-                patched = True
+            if not patched and isinstance(st, Stmt) and isinstance(st.expr, Expr) and st.expr.kind == "phi":
+                if result_kind == "return" and st.kind == "return":
+                    new_stmts.append(Stmt(kind="return", target=st.target, expr=comp_expr,
+                                          origins=st.origins))
+                    patched = True
+                elif result_kind == "assign" and st.kind == "assign" and st.target == result_target:
+                    new_stmts.append(Stmt(kind="assign", target=result_target, expr=comp_expr,
+                                          origins=st.origins))
+                    patched = True
+                else:
+                    new_stmts.append(st)
             else:
                 new_stmts.append(st)
 
@@ -526,28 +825,225 @@ def _fix_comprehensions(blocks, cfg, block_statements, block_conditions, in_stac
             if debug:
                 print(f"[DEBUG] comprehension: {result_target} = {comp_kind}_comp em bloco {result_bid}")
 
-            # Suprime stmts "x = x" (restauração de LOAD_FAST_AND_CLEAR) para todos os lfc_vars
-            lfc_vars_set = set(lfc_vars)
-            for cleanup_bid in list(block_by_id.keys()):
-                c_stmts = block_statements.get(cleanup_bid, [])
-                c_new = []
-                changed = False
-                for st in c_stmts:
-                    # Suprime "x = x" (self-assignment de restauração)
-                    if (isinstance(st, Stmt) and st.kind == "assign"
-                            and st.target in lfc_vars_set
-                            and isinstance(st.expr, Expr) and st.expr.kind == "name"
-                            and st.expr.value == st.target):
-                        changed = True
-                        continue
-                    c_new.append(st)
-                if changed:
-                    block_statements[cleanup_bid] = c_new
+            if comp_kind == "dict":
+                elem_reprs = (expr_repr(comp_key), expr_repr(comp_val))
+            else:
+                elem_reprs = (expr_repr(comp_element),)
+
+            def _matches_inner_accum(e, _k=comp_kind, _reprs=elem_reprs):
+                return _is_leaf_accum(e, _k, _reprs)
+            _subst_everywhere(_matches_inner_accum, comp_expr)
+
+            comp_internal = {build_bid, header_bid, body_bid}
+            if exit_bid is not None:
+                comp_internal.add(exit_bid)
+            visit_q = list(succs.get(header_bid, set()))
+            while visit_q:
+                vb = visit_q.pop()
+                if vb in comp_internal:
+                    continue
+                comp_internal.add(vb)
+                for s in succs.get(vb, set()):
+                    if s != header_bid and s not in comp_internal:
+                        visit_q.append(s)
+            comp_internal.discard(result_bid)
+
+            for cib in comp_internal:
+                block_statements[cib] = []
+                block_conditions.pop(cib, None)
+
+
+def _fix_ternary_phi(blocks, cfg, block_statements, block_conditions, in_stack, out_stack, debug=False):
+    block_by_id = build_block_by_id(blocks)
+    preds_map = build_predecessor_map(blocks, cfg)
+
+    def block_opnames(bid):
+        return get_block_opnames(block_by_id.get(bid, {}))
+
+    def _last_cond_jump_op(bid):
+        instrs = block_by_id.get(bid, {}).get("instructions", []) or []
+        for ins in reversed(instrs):
+            op = ins["opname"]
+            if op.startswith("POP_JUMP") and "IF_" in op:
+                return op
+        return None
+
+    def _jump_target_bid(bid):
+        instrs = block_by_id.get(bid, {}).get("instructions", []) or []
+        for ins in reversed(instrs):
+            op = ins["opname"]
+            if op.startswith("POP_JUMP") and "IF_" in op:
+                tgt = ins.get("argval")
+                if isinstance(tgt, int):
+                    for b2 in blocks:
+                        if b2.get("start_offset") == tgt:
+                            return b2["id"]
+                return None
+        return None
+
+    def _subst_expr(e, old_obj, new_expr):
+        if e is None or not isinstance(e, Expr):
+            return e
+        if e is old_obj:
+            return new_expr
+        if not e.args:
+            return e
+        new_args = tuple(_subst_expr(a, old_obj, new_expr) for a in e.args)
+        if any(na is not e.args[i] for i, na in enumerate(new_args)):
+            return Expr(kind=e.kind, value=e.value, args=new_args, origins=e.origins)
+        return e
+
+    def _subst_stmt(s, old_obj, new_expr):
+        if not isinstance(s, Stmt):
+            return s
+        new_e = _subst_expr(s.expr, old_obj, new_expr) if s.expr is not None else s.expr
+        new_x = _subst_expr(s.extra, old_obj, new_expr) if isinstance(s.extra, Expr) else s.extra
+        if new_e is s.expr and new_x is s.extra:
+            return s
+        return Stmt(kind=s.kind, target=s.target, expr=new_e, extra=new_x, origins=s.origins)
+
+    def _subst_everywhere(old_obj, new_expr):
+        for bid2 in list(in_stack.keys()):
+            in_stack[bid2] = [_subst_expr(v, old_obj, new_expr) for v in in_stack[bid2]]
+        for bid2 in list(out_stack.keys()):
+            out_stack[bid2] = [_subst_expr(v, old_obj, new_expr) for v in out_stack[bid2]]
+        for bid2 in list(block_statements.keys()):
+            block_statements[bid2] = [_subst_stmt(s, old_obj, new_expr) for s in (block_statements[bid2] or [])]
+        for bid2 in list(block_conditions.keys()):
+            block_conditions[bid2] = [_subst_expr(v, old_obj, new_expr) for v in (block_conditions[bid2] or [])]
+
+    ternary_ancestors = set()
+    phi_candidates = []
+    for bid, stk in in_stack.items():
+        for v in stk:
+            if isinstance(v, Expr) and v.kind == "phi" and len(v.args or ()) == 2:
+                phi_candidates.append((v, bid))
+
+    seen_ids = set()
+    uniq = []
+    for (p, b) in phi_candidates:
+        if id(p) in seen_ids:
+            continue
+        seen_ids.add(id(p))
+        uniq.append((p, b))
+
+    for phi_obj, merge_bid in uniq:
+        preds = list(preds_map.get(merge_bid, ()))
+        if len(preds) != 2:
+            continue
+        p1, p2 = preds[0], preds[1]
+        preds_p1 = set(preds_map.get(p1, ()))
+        preds_p2 = set(preds_map.get(p2, ()))
+        common = preds_p1 & preds_p2
+        cand_ancestors = list(common)
+        if p1 in preds_p2:
+            cand_ancestors.append(p1)
+        if p2 in preds_p1:
+            cand_ancestors.append(p2)
+        ancestor = None
+        for a in cand_ancestors:
+            if _last_cond_jump_op(a) is not None:
+                ancestor = a
+                break
+        if ancestor is None:
+            continue
+
+        op_a = _last_cond_jump_op(ancestor)
+        jt = jump_target_bid = _jump_target_bid(ancestor)
+        succs_a = list(cfg.get(ancestor, set()))
+        if len(succs_a) != 2:
+            continue
+        fall_bid = next((s for s in succs_a if s != jump_target_bid), None)
+        if fall_bid is None:
+            continue
+
+        def _reaches(src, dst, seen=None):
+            if seen is None:
+                seen = set()
+            if src == dst:
+                return True
+            if src in seen:
+                return False
+            seen.add(src)
+            for s in cfg.get(src, set()):
+                if _reaches(s, dst, seen):
+                    return True
+            return False
+
+        def _pred_side(pred_bid):
+            if pred_bid == fall_bid:
+                return "fall"
+            if pred_bid == jump_target_bid:
+                return "jump"
+            from_fall = _reaches(fall_bid, pred_bid)
+            from_jump = _reaches(jump_target_bid, pred_bid)
+            if from_fall and not from_jump:
+                return "fall"
+            if from_jump and not from_fall:
+                return "jump"
+            return None
+
+        side_p1 = _pred_side(p1)
+        side_p2 = _pred_side(p2)
+        if side_p1 is None or side_p2 is None or side_p1 == side_p2:
+            continue
+
+        conds = block_conditions.get(ancestor) or []
+        if not conds:
+            continue
+        cond_expr = conds[-1]
+
+        if "IF_FALSE" in op_a or "IF_NONE" in op_a:
+            then_side, else_side = "fall", "jump"
+        else:
+            then_side, else_side = "jump", "fall"
+
+        side_to_pred = {side_p1: p1, side_p2: p2}
+        then_pred = side_to_pred.get(then_side)
+        else_pred = side_to_pred.get(else_side)
+        if then_pred is None or else_pred is None:
+            continue
+
+        phi_args = list(phi_obj.args)
+        then_out = out_stack.get(then_pred) or []
+        else_out = out_stack.get(else_pred) or []
+        then_top = then_out[-1] if then_out else None
+        else_top = else_out[-1] if else_out else None
+
+        def _match(top, args):
+            if top is None:
+                return None
+            for a in args:
+                if a is top:
+                    return a
+            try:
+                tr = expr_repr(top)
+            except Exception:
+                return None
+            for a in args:
+                try:
+                    if expr_repr(a) == tr:
+                        return a
+                except Exception:
+                    pass
+            return None
+
+        then_val = _match(then_top, phi_args)
+        else_val = _match(else_top, phi_args)
+        if then_val is None or else_val is None or then_val is else_val:
+            continue
+
+        ternary = Expr(kind="ternary", args=(cond_expr, then_val, else_val), origins=frozenset())
+        _subst_everywhere(phi_obj, ternary)
+        ternary_ancestors.add(ancestor)
+        block_conditions[ancestor] = []
+        if debug:
+            print(f"[DEBUG] phi→ternary em merge={merge_bid} ancestor={ancestor}")
+
+    return ternary_ancestors
 
 
 def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=False):
-    """Detecta padrões yield from (GET_YIELD_FROM_ITER + SEND loop) e simplifica.
-    Adiciona Stmt(kind='yield_from') ao bloco setup e marca blocos internos."""
     block_by_id = build_block_by_id(blocks)
 
     def block_opnames(bid):
@@ -563,15 +1059,14 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
         if "GET_YIELD_FROM_ITER" not in ops and not is_await and not is_anext:
             continue
 
-        # Extrai iterável do out_stack (yield_from_iter, await ou anext expr)
+
         out = out_stack.get(bid, [])
         iterable_expr = None
         if is_anext:
-            # GET_ANEXT: extrai o iterável original (unwrap anext→aiter→iterable)
+
             for v in reversed(out):
                 if isinstance(v, Expr) and v.kind == "anext" and v.args:
                     aiter_obj = v.args[0]
-                    # Unwrap aiter para obter o iterável original
                     if isinstance(aiter_obj, Expr) and aiter_obj.kind == "aiter" and aiter_obj.args:
                         iterable_expr = aiter_obj.args[0]
                     else:
@@ -586,7 +1081,6 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
         if iterable_expr is None:
             continue
 
-        # Encontra o SEND block (successor direto com SEND)
         send_bid = None
         for succ in cfg.get(bid, set()):
             s_ops = block_opnames(succ)
@@ -596,7 +1090,6 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
         if send_bid is None:
             continue
 
-        # Encontra o END_SEND block: alvo do SEND quando StopIteration/coroutine done
         end_send_bid = None
         for ins in (block_by_id.get(send_bid, {}).get("instructions", []) or []):
             if ins["opname"] == "SEND":
@@ -609,8 +1102,6 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
                             break
                 break
 
-        # BFS de send_bid, mas não ultrapassa o bloco END_SEND nem blocos END_ASYNC_FOR
-        # (blocos normais após END_SEND são código do usuário, não infraestrutura)
         def _is_stop_bid(sid):
             if sid == end_send_bid:
                 return True
@@ -629,9 +1120,6 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
                 if succ not in internal and not _is_stop_bid(succ):
                     work.append(succ)
 
-        # Marca END_SEND como interno apenas se não há código do usuário após END_SEND
-        # Infra pura: END_SEND + POP_TOP + NOP + RESUME + RETURN_CONST None (implícito)
-        # NÃO é infra: STORE_FAST, RETURN_CONST 'done', LOAD_FAST, RETURN_VALUE, etc.
         if end_send_bid is not None:
             end_instrs = block_by_id.get(end_send_bid, {}).get("instructions", []) or []
             pure_infra = True
@@ -640,23 +1128,17 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
                 if op_i in ("END_SEND", "POP_TOP", "NOP", "RESUME"):
                     continue
                 if op_i == "RETURN_CONST" and ins.get("argval") is None:
-                    continue  # return None implícito
+                    continue 
                 pure_infra = False
                 break
             if pure_infra:
                 internal.add(end_send_bid)
 
-        # Detecta se END_SEND captura o resultado (STORE_FAST/STORE_NAME logo após END_SEND)
-        # → `target = await expr` / `target = yield from iterable`
-        # Quando end_send_bid é pure_infra (só END_SEND), verifica o bloco successor
-        # (acontece quando o exception table cria um novo líder imediatamente após END_SEND)
         yf_target = None
-        store_bid = None  # bloco onde está o STORE_FAST (pode ser end_send_bid ou seu successor)
+        store_bid = None  
         if end_send_bid is not None and end_send_bid not in internal:
-            # END_SEND não é pure_infra: STORE pode estar no mesmo bloco
             store_bid = end_send_bid
         elif end_send_bid is not None and end_send_bid in internal:
-            # END_SEND é pure_infra: STORE está no bloco successor (se existir)
             for succ in cfg.get(end_send_bid, set()):
                 if succ not in internal and not _is_stop_bid(succ):
                     store_bid = succ
@@ -668,18 +1150,15 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
                     continue
                 if ins["opname"] in ("STORE_FAST", "STORE_NAME", "STORE_DEREF"):
                     yf_target = ins.get("argval") or str(ins.get("arg", ""))
-                break  # primeira instrução não-END_SEND determina o padrão
+                break   
 
             if yf_target is not None:
-                # Remove o phi-assign `var = phi(...)` do store_bid
                 old_stmts = list(block_statements.get(store_bid, []))
                 new_stmts = [s for s in old_stmts
                              if not (isinstance(s, Stmt) and s.kind == "assign"
                                      and s.target == yf_target)]
                 block_statements[store_bid] = new_stmts
 
-        # GET_AWAITABLE 2 = await __aexit__(...) — infraestrutura do async with.
-        # Não gera stmt; marca o bloco setup e os blocos de cleanup como internos.
         if is_await:
             is_aexit_await = any(
                 ins["opname"] == "GET_AWAITABLE" and ins.get("arg", 0) == 2
@@ -688,7 +1167,6 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
             if is_aexit_await:
                 yield_from_internal.update(internal)
                 yield_from_internal.add(bid)
-                # Marca end_send_bid e seus sucessores de cleanup como internos
                 if end_send_bid is not None:
                     yield_from_internal.add(end_send_bid)
                     _aexit_cleanup_ops = frozenset({
@@ -711,12 +1189,8 @@ def _fix_yield_from(blocks, cfg, block_statements, in_stack, out_stack, debug=Fa
                             for s in cfg.get(cb, set()):
                                 if s not in cseen:
                                     cwork.append(s)
-                continue  # Não adiciona stmt
+                continue  
 
-        # Adiciona Stmt ao bloco setup:
-        # GET_ANEXT (async for) → Stmt(kind="async_for_item")
-        # GET_AWAITABLE → Stmt(kind="await")
-        # GET_YIELD_FROM_ITER → Stmt(kind="yield_from")
         stmt_kind = "async_for_item" if is_anext else ("await" if is_await else "yield_from")
         stmt = Stmt(kind=stmt_kind, expr=iterable_expr, target=yf_target, extra=None, origins=frozenset())
         block_statements[bid] = list(block_statements.get(bid, [])) + [stmt]
@@ -737,7 +1211,6 @@ def merge_stacks(stacks, debug=False):
         seen = set()
 
         for st in stacks:
-            # se esse predecessor não tem esse slot, ignore (não injete unknown)
             if i >= len(st):
                 continue
 
@@ -751,7 +1224,6 @@ def merge_stacks(stacks, debug=False):
                 seen.add(key)
 
         if not vals:
-            # ninguém tinha esse slot -> não inventa pilha
             continue
 
         merged_val = vals[0] if len(vals) == 1 else Expr(kind="phi", args=tuple(vals), origins=frozenset())
@@ -800,19 +1272,12 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
     if op in ("RESUME", "CACHE", "NOP"):
         return
 
-    # -------------------------
-    # Exception machinery 3.11+
-    # -------------------------
     if op == "PUSH_EXC_INFO":
-        # Python 3.12: PUSH_EXC_INFO empurra (prev_exc, new_exc) na pilha de valores.
-        # Stack effect: (-- prev_exc, new_exc). prev_exc é a exceção ativa anterior (salva
-        # internamente); new_exc é a exceção sendo capturada agora (fica no TOS).
-        # Isso é necessário para que SWAP 2 antes de POP_EXCEPT possa colocar o valor
-        # de retorno abaixo de prev_exc, e POP_EXCEPT remova prev_exc corretamente.
+
         prev_exc = Expr(kind="exc", value="prev_exc", origins=frozenset({off}))
         new_exc  = Expr(kind="exc", value="exc",      origins=frozenset({off}))
-        push(prev_exc)   # prev_exc fica na posição 2 (abaixo)
-        push(new_exc)    # new_exc fica no TOS
+        push(prev_exc)  
+        push(new_exc)    
         return
 
     if op == "CHECK_EXC_MATCH":
@@ -833,7 +1298,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
 
     if op == "COPY":
         n = instr.get("arg") or 0
-        # COPY(n) duplica o n-ésimo item do topo (1-indexed, TOS=1)
         idx = -n
         if n > 0 and (-idx) <= len(stack):
             push(stack[idx])
@@ -843,7 +1307,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
 
     if op == "SWAP":
         n = instr.get("arg") or 0
-        # SWAP(n) troca TOS com o n-ésimo item do topo (1-indexed)
         if n <= 1:
             return
         i = -1
@@ -857,9 +1320,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         stmts.append(Stmt(kind="del", target=target, origins=frozenset({off})))
         return
 
-    # -------------------------
-    # Restante
-    # -------------------------
     if op == "PUSH_NULL":
         push(Expr(kind="null", origins=frozenset({off})))
         return
@@ -869,8 +1329,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         return
 
     if op in ("LOAD_FAST", "LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF"):
-        # Em 3.12, LOAD_GLOBAL com arg & 1 == 1 empurra NULL antes do valor
-        # (usado para function calls: NULL + callable)
         if op == "LOAD_GLOBAL":
             raw_arg = instr.get("arg") or 0
             if raw_arg & 1:
@@ -878,12 +1336,9 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="name", value=instr.get("argval"), origins=frozenset({off})))
         return
 
-    # --- Fase 1: LOAD_ATTR ---
     if op == "LOAD_ATTR":
         obj = pop() or unknown()
         attr_name = instr.get("argval")
-        # Em 3.12, LOAD_ATTR com arg & 1 == 1 funciona como method lookup
-        # e empurra [NULL, attr] (como LOAD_METHOD)
         raw_arg = instr.get("arg") or 0
         is_method = bool(raw_arg & 1)
         if is_method:
@@ -891,17 +1346,14 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="attr", value=attr_name, args=(obj,), origins=frozenset({off})))
         return
 
-    # --- Fase 5: LOAD_CLOSURE ---
     if op == "LOAD_CLOSURE":
         push(Expr(kind="closure_var", value=instr.get("argval"), origins=frozenset({off})))
         return
 
-    # --- Fase 5: LOAD_FAST_CHECK / LOAD_FAST_AND_CLEAR ---
     if op in ("LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR"):
         push(Expr(kind="name", value=instr.get("argval"), origins=frozenset({off})))
         return
 
-    # --- Fase 5: LOAD_SUPER_ATTR ---
     if op == "LOAD_SUPER_ATTR":
         self_val = pop() or unknown()
         self_type = pop() or unknown()
@@ -911,22 +1363,18 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="attr", value=attr_name, args=(super_call,), origins=frozenset({off})))
         return
 
-    # --- Fase 9: LOAD_ASSERTION_ERROR ---
     if op == "LOAD_ASSERTION_ERROR":
         push(Expr(kind="name", value="AssertionError", origins=frozenset({off})))
         return
 
-    # --- LOAD_BUILD_CLASS ---
     if op == "LOAD_BUILD_CLASS":
         push(Expr(kind="name", value="__build_class__", origins=frozenset({off})))
         return
 
-    # --- LOAD_LOCALS ---
     if op == "LOAD_LOCALS":
         push(Expr(kind="call", args=(Expr(kind="name", value="locals", origins=frozenset({off})),), origins=frozenset({off})))
         return
 
-    # --- LOAD_METHOD (3.12 otimização de LOAD_ATTR para métodos) ---
     if op == "LOAD_METHOD":
         obj = pop() or unknown()
         attr_name = instr.get("argval")
@@ -934,7 +1382,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="attr", value=attr_name, args=(obj,), origins=frozenset({off})))
         return
 
-    # --- LOAD_SUPER_METHOD / LOAD_ZERO_SUPER_METHOD ---
     if op in ("LOAD_SUPER_METHOD", "LOAD_ZERO_SUPER_METHOD"):
         self_val = pop() or unknown()
         self_type = pop() or unknown()
@@ -945,7 +1392,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="attr", value=attr_name, args=(super_call,), origins=frozenset({off})))
         return
 
-    # --- LOAD_ZERO_SUPER_ATTR ---
     if op == "LOAD_ZERO_SUPER_ATTR":
         self_val = pop() or unknown()
         self_type = pop() or unknown()
@@ -955,13 +1401,11 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="attr", value=attr_name, args=(super_call,), origins=frozenset({off})))
         return
 
-    # --- LOAD_FROM_DICT_OR_DEREF / LOAD_FROM_DICT_OR_GLOBALS ---
     if op in ("LOAD_FROM_DICT_OR_DEREF", "LOAD_FROM_DICT_OR_GLOBALS"):
-        pop()  # mapping (locals dict)
+        pop()  
         push(Expr(kind="name", value=instr.get("argval"), origins=frozenset({off})))
         return
 
-    # --- Generic LOAD_ fallback ---
     if op.startswith("LOAD_"):
         push(unknown())
         return
@@ -988,7 +1432,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="tuple", args=tuple(elems), origins=frozenset({off})))
         return
 
-    # --- Fase 1: BINARY_SUBSCR, STORE_SUBSCR, DELETE_SUBSCR ---
     if op == "BINARY_SUBSCR":
         key = pop() or unknown()
         obj = pop() or unknown()
@@ -1000,6 +1443,19 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         obj = pop() or unknown()
         val = pop() or unknown()
         target_repr = f"{expr_repr(obj)}[{expr_repr(key)}]"
+        if (isinstance(val, Expr) and val.kind == "binop"
+                and isinstance(val.value, str) and val.value.endswith("=")
+                and val.value != "==" and val.value != "!=" and val.value != "<="
+                and val.value != ">="):
+            a0 = val.args[0] if val.args else None
+            if (isinstance(a0, Expr) and a0.kind == "subscr"
+                    and len(a0.args) >= 2
+                    and expr_repr(a0.args[0]) == expr_repr(obj)
+                    and expr_repr(a0.args[1]) == expr_repr(key)):
+                stmts.append(Stmt(kind="augassign", target=target_repr,
+                                  expr=val.args[1], extra=val.value,
+                                  origins=frozenset({off})))
+                return
         stmts.append(Stmt(kind="store_subscr", target=target_repr, expr=val, origins=frozenset({off})))
         return
 
@@ -1010,7 +1466,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         stmts.append(Stmt(kind="del_subscr", target=target_repr, origins=frozenset({off})))
         return
 
-    # --- Fase 1: BINARY_SLICE, STORE_SLICE, BUILD_SLICE ---
     if op == "BINARY_SLICE":
         end = pop() or unknown()
         start = pop() or unknown()
@@ -1045,7 +1500,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
             push(Expr(kind="slice", args=(start, end), origins=frozenset({off})))
         return
 
-    # --- Fase 1: UNARY_NEGATIVE, UNARY_NOT, UNARY_INVERT ---
     if op == "UNARY_NEGATIVE":
         val = pop() or unknown()
         push(Expr(kind="unary", value="-", args=(val,), origins=frozenset({off})))
@@ -1061,7 +1515,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="unary", value="~", args=(val,), origins=frozenset({off})))
         return
 
-    # --- Fase 1: IS_OP, CONTAINS_OP ---
     if op == "IS_OP":
         b = pop() or unknown()
         a = pop() or unknown()
@@ -1076,13 +1529,11 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="contains", value=invert, args=(a, b), origins=frozenset({off})))
         return
 
-    # --- Fase 1: END_FOR ---
     if op == "END_FOR":
         pop()
         pop()
         return
 
-    # --- Fase 3: BUILD_SET, BUILD_MAP, BUILD_CONST_KEY_MAP ---
     if op == "BUILD_SET":
         n = instr.get("arg") or 0
         elems = list(reversed(pop_n(n)))
@@ -1109,7 +1560,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
             push(Expr(kind="dict", args=tuple(vals), value="const_keys", origins=frozenset({off})))
         return
 
-    # --- Fase 3: MAP_ADD, SET_ADD ---
     if op == "MAP_ADD":
         n = instr.get("arg") or 0
         val = pop() or unknown()
@@ -1129,14 +1579,25 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
             stack[idx] = Expr(kind="set", args=tuple(s.args) + (item,), origins=s.origins | frozenset({off}))
         return
 
-    # --- Fase 3: DICT_MERGE, DICT_UPDATE, SET_UPDATE ---
     if op in ("DICT_MERGE", "DICT_UPDATE"):
         n = instr.get("arg") or 0
         update = pop() or unknown()
         idx = -(n)
         if -idx <= len(stack):
             d = stack[idx]
-            stack[idx] = Expr(kind="dict", args=tuple(getattr(d, 'args', ())) + (
+            d_args = tuple(getattr(d, 'args', ()))
+            if isinstance(update, Expr) and update.kind == "dict":
+                has_inner_unpack = False
+                for i in range(0, len(update.args), 2):
+                    k_e = update.args[i] if i < len(update.args) else None
+                    if isinstance(k_e, Expr) and k_e.kind == "const" and k_e.value is None:
+                        has_inner_unpack = True
+                        break
+                if not has_inner_unpack:
+                    stack[idx] = Expr(kind="dict", args=d_args + tuple(update.args),
+                                       value="unpack", origins=frozenset({off}))
+                    return
+            stack[idx] = Expr(kind="dict", args=d_args + (
                 Expr(kind="const", value=None, origins=frozenset({off})),
                 update,
             ), value="unpack", origins=frozenset({off}))
@@ -1148,7 +1609,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         idx = -(n)
         if -idx <= len(stack):
             s = stack[idx]
-            # Se update é um frozenset constante, expande seus elementos
             if isinstance(update, Expr) and update.kind == "const" and isinstance(update.value, frozenset):
                 new_elems = tuple(
                     Expr(kind="const", value=v, origins=frozenset({off}))
@@ -1156,10 +1616,10 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
                 )
                 stack[idx] = Expr(kind="set", args=tuple(getattr(s, 'args', ())) + new_elems, origins=frozenset({off}))
             else:
-                stack[idx] = Expr(kind="set", args=tuple(getattr(s, 'args', ())) + (update,), origins=frozenset({off}))
-        return
 
-    # --- Fase 3: BUILD_STRING, FORMAT_*, CONVERT_VALUE ---
+                starred = Expr(kind="starred", args=(update,), origins=frozenset({off}))
+                stack[idx] = Expr(kind="set", args=tuple(getattr(s, 'args', ())) + (starred,), origins=frozenset({off}))
+        return
     if op == "BUILD_STRING":
         n = instr.get("arg") or 0
         parts = list(reversed(pop_n(n)))
@@ -1200,7 +1660,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="format", value=None, args=(val, conv_expr), origins=frozenset({off})))
         return
 
-    # --- Fase 4: UNPACK_SEQUENCE, UNPACK_EX ---
     if op == "UNPACK_SEQUENCE":
         n = instr.get("arg") or 0
         seq = pop() or unknown()
@@ -1221,7 +1680,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
                 push(Expr(kind="unpack", value=i, args=(seq,), origins=frozenset({off})))
         return
 
-    # --- Fase 2: IMPORT_NAME, IMPORT_FROM, IMPORT_STAR ---
     if op == "IMPORT_NAME":
         fromlist = pop() or unknown()
         level = pop() or unknown()
@@ -1241,7 +1699,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         stmts.append(Stmt(kind="import_star", target=str(module_name), origins=frozenset({off})))
         return
 
-    # --- Fase 5: MAKE_FUNCTION ---
     if op == "MAKE_FUNCTION":
         flags = instr.get("arg") or 0
         code = pop() or unknown()
@@ -1250,21 +1707,19 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         kwdefaults = None
         defaults = None
         if flags & 0x08:
-            closure = pop()  # closure tuple
+            closure = pop()  
         if flags & 0x04:
-            annotations = pop()  # annotations
+            annotations = pop() 
         if flags & 0x02:
-            kwdefaults = pop()  # kwdefaults dict
+            kwdefaults = pop()  
         if flags & 0x01:
-            defaults = pop()  # defaults tuple
+            defaults = pop()  
         push(Expr(kind="make_function", value=flags, args=(code, defaults, kwdefaults, annotations), origins=frozenset({off})))
         return
 
-    # --- Fase 5: MAKE_CELL, COPY_FREE_VARS ---
     if op in ("MAKE_CELL", "COPY_FREE_VARS"):
         return
 
-    # --- Fase 6: BEFORE_WITH, WITH_EXCEPT_START ---
     if op == "BEFORE_WITH":
         ctx = pop() or unknown()
         push(Expr(kind="with_exit", args=(ctx,), origins=frozenset({off})))
@@ -1277,7 +1732,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
             push(Expr(kind="with_cleanup", args=(exc,), origins=frozenset({off})))
         return
 
-    # --- Fase 7: RETURN_GENERATOR, YIELD_VALUE ---
     if op == "RETURN_GENERATOR":
         return
 
@@ -1318,7 +1772,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="async_with_enter", args=(ctx,), origins=frozenset({off})))
         return
 
-    # --- Fase 8: MATCH_* opcodes ---
     if op == "MATCH_SEQUENCE":
         subject = stack[-1] if stack else unknown()
         push(Expr(kind="match_sequence", args=(subject,), origins=frozenset({off})))
@@ -1347,8 +1800,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         obj = stack[-1] if stack else unknown()
         push(Expr(kind="get_len", args=(obj,), origins=frozenset({off})))
         return
-
-    # --- Fase 9: EXTENDED_ARG, CALL_INTRINSIC_1/2 ---
     if op == "EXTENDED_ARG":
         return
 
@@ -1373,7 +1824,8 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
                 elems = tuple(Expr(kind="const", value=v, origins=frozenset({off})) for v in it.value)
                 stack[-1] = Expr(kind="list", args=tuple(lst.args) + elems, origins=lst.origins | frozenset({off}))
             else:
-                stack[-1] = Expr(kind="list_extend", args=(lst, it or unknown()), origins=frozenset({off}))
+                starred = Expr(kind="starred", args=(it or unknown(),), origins=frozenset({off}))
+                stack[-1] = Expr(kind="list", args=tuple(lst.args) + (starred,), origins=lst.origins | frozenset({off}))
         else:
             stack[-1] = Expr(kind="list_extend", args=(lst or unknown(), it or unknown()), origins=frozenset({off}))
         return
@@ -1381,7 +1833,7 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
     if op == "LIST_APPEND":
         n = instr.get("arg") or 0
         item = pop()
-        idx = -n  # PEEK(n) após pop: stack[-n] é o acumulador (mesmo índice do CPython PEEK)
+        idx = -n 
         if n > 0 and n <= len(stack):
             lst = stack[idx]
             if isinstance(lst, Expr) and lst.kind == "list":
@@ -1421,11 +1873,8 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         args = list(reversed(pop_n(n)))
         fn = pop() or unknown()
         if stack and isinstance(stack[-1], Expr) and stack[-1].kind == "null":
-            pop()  # function call com NULL
+            pop() 
         elif stack and isinstance(stack[-1], Expr):
-            # Sem NULL: o item abaixo do callable é o callable real (method call em 3.12)
-            # LOAD_NAME(decorator) + MAKE_FUNCTION + CALL 0 → swap: decorator(make_function)
-            # LOAD_ASSERTION_ERROR + LOAD_CONST(msg) + CALL 0 → swap: AssertionError(msg)
             real_callable = pop()
             args = [fn] + args
             fn = real_callable
@@ -1461,7 +1910,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
                                                 "match_class", "match_sequence", "match_mapping",
                                                 "match_keys"):
             return
-        # Suprime chamada __exit__(None, None, None) gerada pelo with-statement
         if isinstance(v, Expr) and v.kind == "call" and v.args:
             fn = v.args[0]
             if isinstance(fn, Expr) and fn.kind in ("with_exit", "with_cleanup", "async_with_exit"):
@@ -1469,12 +1917,24 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         stmts.append(Stmt(kind="expr", expr=v, origins=frozenset({off})))
         return
 
-    # --- Fase 1: STORE_ATTR, DELETE_ATTR ---
     if op == "STORE_ATTR":
         obj = pop() or unknown()
         val = pop() or unknown()
         attr_name = str(instr.get("argval"))
         obj_repr = expr_repr(obj)
+        if (isinstance(val, Expr) and val.kind == "binop"
+                and isinstance(val.value, str) and val.value.endswith("=")
+                and val.value != "==" and val.value != "!=" and val.value != "<="
+                and val.value != ">="):
+            a0 = val.args[0] if val.args else None
+            if (isinstance(a0, Expr) and a0.kind == "attr"
+                    and str(a0.value) == attr_name
+                    and a0.args and expr_repr(a0.args[0]) == obj_repr):
+                target_repr = f"{obj_repr}.{attr_name}"
+                stmts.append(Stmt(kind="augassign", target=target_repr,
+                                  expr=val.args[1], extra=val.value,
+                                  origins=frozenset({off})))
+                return
         stmts.append(Stmt(kind="store_attr", target=attr_name, expr=val, extra=obj_repr, origins=frozenset({off})))
         return
 
@@ -1485,7 +1945,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         stmts.append(Stmt(kind="del_attr", target=attr_name, extra=obj_repr, origins=frozenset({off})))
         return
 
-    # --- Fase 4: DELETE_NAME, DELETE_GLOBAL, DELETE_DEREF ---
     if op in ("DELETE_NAME", "DELETE_GLOBAL", "DELETE_DEREF"):
         target = str(instr.get("argval"))
         stmts.append(Stmt(kind="del", target=target, origins=frozenset({off})))
@@ -1494,8 +1953,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
     if op in ("STORE_FAST", "STORE_FAST_MAYBE_NULL", "STORE_NAME", "STORE_GLOBAL", "STORE_DEREF"):
         target = str(instr.get("argval"))
         rhs = pop() or unknown()
-
-        # --- Fase 2: Import detection ---
         if isinstance(rhs, Expr) and rhs.kind == "import":
             module_name = str(rhs.value)
             stmts.append(Stmt(kind="import", target=target, extra=module_name, origins=frozenset({off})))
@@ -1519,24 +1976,19 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         stmts.append(Stmt(kind="assign", target=target, expr=rhs, origins=frozenset({off})))
         return
 
-    # --- Fase 1: STORE_ATTR for generic STORE_ fallback (catches STORE_SUBSCR already handled above) ---
+
     if op.startswith("STORE_"):
         rhs = pop() or unknown()
         stmts.append(Stmt(kind="assign", target="unknown_target", expr=rhs, origins=frozenset({off})))
         return
 
-    # --- Fase 1: POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE ---
     if op in ("POP_JUMP_IF_NONE", "POP_JUMP_IF_NOT_NONE"):
         cond = pop()
         if cond is not None:
             none_const = Expr(kind="const", value=None, origins=frozenset({off}))
             if op == "POP_JUMP_IF_NONE":
-                # jump_on_true("POP_JUMP_IF_NONE") = False → true_succ = fall_block (NOT None)
-                # Condição deve ser "is not None" para que "if cond: [fall]" faça sentido
                 expr = Expr(kind="is", value=1, args=(cond, none_const), origins=frozenset({off}))
             else:
-                # POP_JUMP_IF_NOT_NONE: jump_on_true = True → true_succ = jump_block (NOT None)
-                # Condição "is not None" para que "if cond: [jump]" faça sentido
                 expr = Expr(kind="is", value=1, args=(cond, none_const), origins=frozenset({off}))
             block_conds.append(expr)
         return
@@ -1553,9 +2005,6 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
             block_conds.append(cond)
         return
 
-    # -------------------------
-    # RETURN: apenas marca (decisão é no nível do bloco)
-    # -------------------------
     if op == "RETURN_VALUE":
         val = pop()
         push(Expr(kind="return_value", args=(val,), origins=frozenset({off})))
@@ -1583,37 +2032,31 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         stack.clear()
         return
 
-    # --- Opcodes de salto puro (sem efeito na pilha, CFG trata) ---
     if op in ("JUMP", "JUMP_FORWARD", "JUMP_BACKWARD",
               "JUMP_BACKWARD_NO_INTERRUPT", "JUMP_NO_INTERRUPT"):
         return
 
-    # --- Pre-3.11 / sem efeito de pilha em 3.12 ---
     if op in ("POP_BLOCK", "SETUP_FINALLY", "SETUP_WITH", "SETUP_CLEANUP",
               "SETUP_ANNOTATIONS", "INTERPRETER_EXIT"):
         return
 
-    # --- END_ASYNC_FOR ---
     if op == "END_ASYNC_FOR":
         pop()
         pop()
         return
 
-    # --- CLEANUP_THROW ---
     if op == "CLEANUP_THROW":
-        pop()  # exc
+        pop()  
         val = pop() or unknown()
-        pop()  # sub
+        pop() 
         push(val)
         return
 
-    # --- GET_YIELD_FROM_ITER ---
     if op == "GET_YIELD_FROM_ITER":
         iterable = pop() or unknown()
         push(Expr(kind="yield_from_iter", args=(iterable,), origins=frozenset({off})))
         return
 
-    # --- CHECK_EG_MATCH (except*, PEP 654) ---
     if op == "CHECK_EG_MATCH":
         exc_type = pop() or unknown()
         exc = pop() or unknown()
@@ -1621,6 +2064,5 @@ def simulate_instruction(instr, stack: List[Expr], stmts: List[Stmt], block_cond
         push(Expr(kind="exc_group_match", args=(exc, exc_type), origins=frozenset({off})))
         return
 
-    # --- Fallback: opcode não reconhecido ---
     if debug:
         print(f"[DEBUG] Opcode não tratado: {op} @ offset {off}")
