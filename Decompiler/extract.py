@@ -30,11 +30,9 @@ def extract_code_objects(code_obj, depth=0, debug=False):
         if isinstance(const, types.CodeType):
             children.append(extract_code_objects(const, depth=depth + 1, debug=False))
 
-    # Extrai defaults/kwdefaults do MAKE_FUNCTION no pai e associa aos filhos
+
     _attach_defaults_to_children(children, stack_info)
-    # Substitui call(make_function(<genexpr>), iter_arg) por Expr(genexpr, ...) no pai
     _fix_genexpr_calls(children, stack_info)
-    # Substitui make_function(<lambda>) por Expr(lambda, ...) no pai
     _fix_lambda_calls(children, stack_info)
 
     return {
@@ -86,42 +84,65 @@ def _attach_defaults_to_children(children, stack_info):
 
 
 def _extract_genexpr_info(child):
-    """Extrai (element_expr, loop_var) de um child cujo co_name é '<genexpr>'.
-    Procura o bloco com YIELD_VALUE e extrai o valor gerado e a variável de loop."""
+
     code_obj = child.get("code_obj")
     if not (isinstance(code_obj, types.CodeType) and code_obj.co_name == "<genexpr>"):
         return None
     stack_info = child.get("stack_info") or {}
     block_stmts = stack_info.get("block_statements") or {}
+    block_conds = stack_info.get("block_conditions") or {}
 
     element_expr = None
     loop_var = None
+    tuple_unpack = {}
 
+    yield_bids = set()
     for _bid, stmts in block_stmts.items():
         for st in stmts:
             if not isinstance(st, Stmt):
                 continue
-            # YIELD_VALUE → elemento da genexpr
             if st.kind == "expr" and isinstance(st.expr, Expr) and st.expr.kind == "yield":
+                yield_bids.add(_bid)
                 if element_expr is None and st.expr.args:
                     element_expr = st.expr.args[0]
-            # x = next(.0) → variável de loop
             if st.kind == "assign" and isinstance(st.expr, Expr) and st.expr.kind == "next":
                 if loop_var is None:
                     loop_var = st.target
+            if (st.kind == "assign" and isinstance(st.expr, Expr)
+                    and st.expr.kind == "unpack" and st.expr.args
+                    and isinstance(st.expr.value, int)):
+                obj_e = st.expr.args[0]
+                if isinstance(obj_e, Expr) and obj_e.kind == "next":
+                    tuple_unpack.setdefault(st.expr.value, st.target)
+
+
+    if tuple_unpack and all(i in tuple_unpack for i in range(len(tuple_unpack))):
+        names = [tuple_unpack[i] for i in range(len(tuple_unpack))]
+        loop_var = Expr(
+            kind="tuple",
+            args=tuple(Expr(kind="name", value=n, origins=frozenset()) for n in names),
+            origins=frozenset(),
+        )
 
     if element_expr is None or loop_var is None:
         return None
-    return (element_expr, loop_var)
+
+    filter_exprs = []
+    for _bid in sorted(block_conds.keys()):
+        if _bid in yield_bids:
+            continue
+        for _c in block_conds.get(_bid, ()):
+            if isinstance(_c, Expr):
+                filter_exprs.append(_c)
+
+    return (element_expr, loop_var, filter_exprs)
 
 
 def _subst_genexpr_in_expr(expr, genexpr_map):
-    """Substitui recursivamente call(make_function(<genexpr>), iter_arg)
-    por Expr(kind='genexpr', args=(element, var_name, iterable))."""
+
     if not isinstance(expr, Expr):
         return expr
 
-    # Padrão alvo: call(make_function(genexpr_code), iter_arg)
     if expr.kind == "call" and len(expr.args) >= 2:
         fn_e = expr.args[0]
         iter_arg = expr.args[1]
@@ -131,23 +152,28 @@ def _subst_genexpr_in_expr(expr, genexpr_map):
                 and fn_e.args[0].kind == "const"):
             code_id = id(fn_e.args[0].value)
             if code_id in genexpr_map:
-                element_expr, loop_var = genexpr_map[code_id]
-                # Desfaz iter() para obter o iterável original
+                element_expr, loop_var, filter_exprs = genexpr_map[code_id]
                 if isinstance(iter_arg, Expr) and iter_arg.kind == "iter" and iter_arg.args:
                     actual_iterable = iter_arg.args[0]
                 else:
                     actual_iterable = iter_arg
+                if isinstance(loop_var, Expr):
+                    var_expr = loop_var
+                else:
+                    var_expr = Expr(kind="name", value=loop_var, origins=frozenset())
+                gx_args = [
+                    element_expr,
+                    var_expr,
+                    actual_iterable,
+                ]
+
+                gx_args.extend(filter_exprs)
                 return Expr(
                     kind="genexpr",
-                    args=(
-                        element_expr,
-                        Expr(kind="name", value=loop_var, origins=frozenset()),
-                        actual_iterable,
-                    ),
+                    args=tuple(gx_args),
                     origins=expr.origins,
                 )
 
-    # Recursão nos args
     new_args = tuple(_subst_genexpr_in_expr(a, genexpr_map) for a in (expr.args or ()))
     if new_args != expr.args:
         return Expr(kind=expr.kind, value=expr.value, args=new_args, origins=expr.origins)
@@ -169,7 +195,34 @@ def _extract_lambda_info(child):
     if not (isinstance(code_obj, types.CodeType) and code_obj.co_name == "<lambda>"):
         return None
 
-    params_str = ", ".join(code_obj.co_varnames[:code_obj.co_argcount])
+    argc = code_obj.co_argcount or 0
+    posonly = code_obj.co_posonlyargcount or 0
+    kwonly = code_obj.co_kwonlyargcount or 0
+    flags = code_obj.co_flags
+    varnames = list(code_obj.co_varnames)
+    has_varargs = bool(flags & 0x04)
+    has_varkw = bool(flags & 0x08)
+
+    parts = []
+    for i, name in enumerate(varnames[:argc]):
+        parts.append(name)
+        if posonly > 0 and i == posonly - 1:
+            parts.append("/")
+    if has_varargs:
+        va_idx = argc + kwonly
+        va_name = varnames[va_idx] if va_idx < len(varnames) else "args"
+        parts.append(f"*{va_name}")
+    elif kwonly > 0:
+        parts.append("*")
+    for i in range(kwonly):
+        idx = argc + i
+        if idx < len(varnames):
+            parts.append(varnames[idx])
+    if has_varkw:
+        kw_idx = argc + kwonly + (1 if has_varargs else 0)
+        kw_name = varnames[kw_idx] if kw_idx < len(varnames) else "kwargs"
+        parts.append(f"**{kw_name}")
+    params_str = ", ".join(parts)
 
     stack_info = child.get("stack_info") or {}
     block_stmts = stack_info.get("block_statements") or {}
@@ -189,11 +242,10 @@ def _extract_lambda_info(child):
 
 
 def _subst_lambda_in_expr(expr, lambda_map):
-    """Substitui make_function(<lambda_code>) por Expr(kind='lambda', value=params, args=(body,))."""
+
     if not isinstance(expr, Expr):
         return expr
 
-    # Padrão alvo: make_function(lambda_code_const, ...)
     if (expr.kind == "make_function"
             and expr.args
             and isinstance(expr.args[0], Expr)
@@ -203,7 +255,6 @@ def _subst_lambda_in_expr(expr, lambda_map):
             params_str, body_expr = lambda_map[code_id]
             return Expr(kind="lambda", value=params_str, args=(body_expr,), origins=expr.origins)
 
-    # Recursão nos args
     new_args = tuple(_subst_lambda_in_expr(a, lambda_map) for a in (expr.args or ()))
     if new_args != expr.args:
         return Expr(kind=expr.kind, value=expr.value, args=new_args, origins=expr.origins)
@@ -220,7 +271,6 @@ def _subst_lambda_in_stmt(st, lambda_map):
 
 
 def _fix_lambda_calls(children, stack_info):
-    """Substitui, no stack_info do pai, make_function(<lambda>) por Expr(kind='lambda', ...)."""
     lambda_map = {}
     for ch in children:
         info = _extract_lambda_info(ch)
@@ -247,8 +297,6 @@ def _fix_lambda_calls(children, stack_info):
 
 
 def _fix_genexpr_calls(children, stack_info):
-    """Substitui, no stack_info do pai, todas as ocorrências de
-    call(make_function(<genexpr>_code), iter_arg) por Expr(kind='genexpr', ...)."""
     genexpr_map = {}
     for ch in children:
         info = _extract_genexpr_info(ch)
