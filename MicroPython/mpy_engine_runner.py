@@ -1,17 +1,3 @@
-"""
-Runner do subprocess MicroPython.
-
-Análogo ao Decompiler/engine_runner.py, mas para arquivos .mpy.
-
-Interface pública:
-    run_mpy_engine(mpy_path) -> tuple[str, str, dict]
-        bytecode_text  — disassembly formatado (seção BYTECODE)
-        recovered_text — código Python recuperado (seção RECOVERED)
-        meta           — {name: {"addr": str, "line": int}, ...}
-                         + entrada especial "__mpy__" com info do formato:
-                           {"version": "v6.N", "arch": "arch_name"}
-"""
-
 import os
 import subprocess
 from pathlib import Path
@@ -29,21 +15,7 @@ MPY_ENGINE   = str(_HERE / "mpy_engine.py")
 
 
 def run_mpy_engine(mpy_path: str) -> tuple[str, str, dict]:
-    """
-    Executa mpy_engine.py como subprocess e retorna as três seções.
 
-    Retorna:
-        (bytecode_text, recovered_text, meta)
-
-    Onde meta é um dict:
-        {
-            "name": {"addr": "0x...", "line": int},
-            ...
-            "__mpy__": {"version": "v6.N", "arch": "arch_name"},
-        }
-
-    Lança RuntimeError se o subprocess falhar.
-    """
     cmd  = [ENGINE_PYTHON, MPY_ENGINE, mpy_path]
     proc = subprocess.run(
         cmd,
@@ -86,11 +58,10 @@ def run_mpy_engine(mpy_path: str) -> tuple[str, str, dict]:
                 continue
             name, addr, line_no = parts
 
-            # Linha especial de metadados do formato .mpy
             if name.strip() == "__mpy__":
                 meta["__mpy__"] = {
-                    "version": addr.strip(),   # e.g. "v6.0"
-                    "arch":    line_no.strip(), # e.g. "bytecode" / "armv6m"
+                    "version": addr.strip(),  
+                    "arch":    line_no.strip(),
                 }
                 continue
 
