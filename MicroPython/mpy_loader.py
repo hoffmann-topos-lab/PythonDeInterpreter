@@ -1,55 +1,40 @@
-"""
-Parser do formato .mpy (MicroPython bytecode), versão 6.x.
-
-Suporta MicroPython 1.19–1.27 (sub-versões 6.0–6.3).
-
-Fontes:
-  https://docs.micropython.org/en/latest/reference/mpyfiles.html
-  https://github.com/micropython/micropython/blob/master/py/persistentcode.c
-  https://github.com/micropython/micropython/blob/master/py/bc0.h
-"""
-
 import io
 from dataclasses import dataclass, field
 from typing import Any, List
 
-# ---------------------------------------------------------------------------
-# Tabela de arquiteturas (bits 5–2 do byte 2 do header)
-# ---------------------------------------------------------------------------
+
 ARCH_NAMES = {
     0:  "bytecode",
     1:  "x86",
     2:  "x64",
     3:  "armv6",
-    4:  "armv6m",      # RP2040 (Pico / Pico W)
-    5:  "armv7m",      # RP2350 modo ARM (Pico 2), STM32F1/F2/F3
-    6:  "armv7em",     # STM32F4/F7, nRF52
-    7:  "armv7emsp",   # STM32 FPU single-precision
-    8:  "armv7emdp",   # STM32 FPU double-precision
-    9:  "xtensa",      # ESP8266
-    10: "xtensawin",   # ESP32, ESP32-S2, ESP32-S3
-    11: "rv32imc",     # RP2350 modo RISC-V (Pico 2), ESP32-C3/C6/P4
+    4:  "armv6m",     
+    5:  "armv7m",      
+    6:  "armv7em",    
+    7:  "armv7emsp",  
+    8:  "armv7emdp",   
+    9:  "xtensa",    
+    10: "xtensawin",  
+    11: "rv32imc",     
     12: "rv64imc",
 }
 
-# Tipos de raw-code (bits 1-0 do header vuint)
+
 KIND_BYTECODE = 0
-KIND_NATIVE   = 1   # @micropython.native  → código de máquina
-KIND_VIPER    = 2   # @micropython.viper   → código de máquina tipado
-KIND_ASM      = 3   # @micropython.asm_thumb etc.
+KIND_NATIVE   = 1   
+KIND_VIPER    = 2   
+KIND_ASM      = 3   
 
 
-# ---------------------------------------------------------------------------
-# Estrutura de dados
-# ---------------------------------------------------------------------------
+
 
 @dataclass
 class RawCodeObject:
     """Um elemento raw-code do arquivo .mpy."""
-    kind: int                                   # KIND_BYTECODE / KIND_NATIVE / KIND_VIPER
-    code: bytes                                 # bytes crus (inclui preâmbulo para bytecode)
+    kind: int                                  
+    code: bytes                                
     children: List["RawCodeObject"] = field(default_factory=list)
-    prelude_offset: int = -1                    # offset do prelude dentro de code (native only)
+    prelude_offset: int = -1                   
 
     @property
     def kind_name(self) -> str:
@@ -58,18 +43,8 @@ class RawCodeObject:
         )
 
 
-# ---------------------------------------------------------------------------
-# Decodificador de vuint
-# ---------------------------------------------------------------------------
-
 def _read_vuint(stream) -> int:
-    """
-    Decodifica um variably-encoded unsigned integer (MSB-first).
 
-    Formato MicroPython: 7 bits úteis por byte, MSB-first (big-endian groups).
-    MSB=1 indica que mais bytes seguem; MSB=0 é o último byte.
-    result = (result << 7) | (byte & 0x7F)
-    """
     result = 0
     while True:
         b = stream.read(1)
@@ -81,25 +56,8 @@ def _read_vuint(stream) -> int:
             break
     return result
 
-
-# ---------------------------------------------------------------------------
-# Parser do header
-# ---------------------------------------------------------------------------
-
 def _parse_header(stream) -> dict:
-    """
-    Lê e valida o header de 4 bytes do .mpy.
 
-    Layout:
-      Byte 0: 0x4D ('M')
-      Byte 1: versão major (6)
-      Byte 2: flags/arquitetura
-                bit 7   : reservado (0)
-                bit 6   : se 1, um vuint extra de flags de arq. segue
-                bits 5-2: código de arquitetura
-                bits 1-0: sub-versão
-      Byte 3: bits de small int (31 ou 63)
-    """
     magic = stream.read(1)
     if magic != b"M":
         raise ValueError(f"Magic inválido: {magic!r} (esperado b'M')")
@@ -140,22 +98,12 @@ def _parse_header(stream) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Tabela de qstrs built-in (mpy-cross v1.27, arch=0)
-#
-# Qstrs estáticos são referenciados apenas pelo ID numérico no .mpy.
-# Esta tabela mapeia IDs conhecidos → string real.
-#
-# IDs confirmados via análise de tests/mpy/ com mpy-cross v1.27.
-# Para descobrir mais IDs: executar tests/mpy/discover_builtin_qstrs.py.
-# ---------------------------------------------------------------------------
+
 
 _BUILTIN_QSTRS: dict = {
-    # Todos os IDs abaixo foram confirmados empiricamente via arquivos probe
-    # compilados com mpy-cross v1.27 (mpy-cross versionado em venv/).
-    # IDs não mapeados retornam "<static:N>" no fallback de _parse_qstr_table.
-
-    # --- Dunders de protocolo (confirmados via probe5 / probe8) ---
+    5:   ".0",             
+    7:   "<module>",      
+    8:   "_",
     9:   "__call__",
     10:  "__class__",
     11:  "__delitem__",
@@ -165,23 +113,29 @@ _BUILTIN_QSTRS: dict = {
     15:  "__getitem__",
     16:  "__hash__",
     17:  "__init__",
-    19:  "__next__",
-    20:  "__iter__",
+    19:  "__iter__",
+    20:  "__len__",
     22:  "__module__",
     23:  "__name__",
     24:  "__new__",
+    25:  "__next__",         
     26:  "__qualname__",
-    27:  "__len__",
+    27:  "__repr__",
     28:  "__setitem__",
     29:  "__str__",
-
-    # --- Exceções built-in (confirmados via probe3) ---
+    30:  "ArithmeticError",
     31:  "AssertionError",
     32:  "AttributeError",
+    33:  "BaseException",
+    34:  "EOFError",
     36:  "Exception",
+    37:  "GeneratorExit",
     38:  "ImportError",
+    39:  "IndentationError",
     40:  "IndexError",
     41:  "KeyError",
+    42:  "KeyboardInterrupt",
+    43:  "LookupError",
     44:  "MemoryError",
     45:  "NameError",
     47:  "NotImplementedError",
@@ -189,28 +143,37 @@ _BUILTIN_QSTRS: dict = {
     49:  "OverflowError",
     50:  "RuntimeError",
     51:  "StopIteration",
+    52:  "SyntaxError",
+    53:  "SystemExit",
     54:  "TypeError",
     55:  "ValueError",
     56:  "ZeroDivisionError",
-
-    # --- Funções / tipos built-in (confirmados via probe2/4/6/7/8/9) ---
     57:  "abs",
     58:  "all",
     59:  "any",
     60:  "append",
+    61:  "args",
     62:  "bool",
+    64:  "bytearray",
+    66:  "bytes",
     67:  "callable",
     68:  "chr",
     69:  "classmethod",
     70:  "clear",
+    71:  "close",
+    72:  "const",
     73:  "copy",
     74:  "count",
     75:  "dict",
     76:  "dir",
     77:  "divmod",
+    79:  "endswith",
     80:  "eval",
+    81:  "exec",
     82:  "extend",
+    83:  "find",
     84:  "format",
+    85:  "from_bytes",
     86:  "get",
     87:  "getattr",
     88:  "globals",
@@ -224,10 +187,15 @@ _BUILTIN_QSTRS: dict = {
     100: "issubclass",
     102: "items",
     103: "iter",
+    104: "join",
+    105: "key",
     106: "keys",
     107: "len",
     108: "list",
     110: "locals",
+    111: "lower",
+    112: "lstrip",
+    113: "main",
     114: "map",
     115: "micropython",
     116: "next",
@@ -235,47 +203,51 @@ _BUILTIN_QSTRS: dict = {
     118: "open",
     119: "ord",
     120: "pop",
+    121: "popitem",
     122: "pow",
     123: "print",
     124: "range",
+    125: "read",
+    126: "readinto",
+    127: "readline",
     128: "remove",
+    129: "replace",
     130: "repr",
     131: "reverse",
+    132: "rfind",
     134: "round",
+    136: "rstrip",
+    137: "self",
+    138: "send",
     140: "set",
     141: "setattr",
     142: "setdefault",
     143: "sort",
     144: "sorted",
+    145: "split",
+    146: "start",
+    147: "startswith",
     148: "staticmethod",
+    149: "step",
+    150: "stop",
     151: "str",
+    152: "strip",
     153: "sum",
     154: "super",
+    156: "to_bytes",
     157: "tuple",
     158: "type",
     159: "update",
+    160: "upper",
+    162: "value",
     163: "values",
+    164: "write",
     165: "zip",
 }
 
 
-# ---------------------------------------------------------------------------
-# Parser da tabela de qstrs
-# ---------------------------------------------------------------------------
-
 def _parse_qstr_table(stream, n: int) -> list:
-    """
-    Lê n qstrs da tabela global.
 
-    Formato de cada entrada (py/persistentcode.c — load_qstr):
-      len_enc = vuint
-        se len_enc & 1 == 1 → qstr estática (built-in): id = len_enc >> 1, sem dados
-        senão               → qstr dinâmica: length = len_enc >> 1,
-                              seguido de `length` bytes UTF-8 + 1 byte terminador nulo
-
-    IDs estáticos são resolvidos via _BUILTIN_QSTRS. IDs não mapeados ficam
-    como "<static:N>" — executar tests/mpy/discover_builtin_qstrs.py para ampliar.
-    """
     qstrs = []
     for _ in range(n):
         len_enc = _read_vuint(stream)
@@ -288,52 +260,34 @@ def _parse_qstr_table(stream, n: int) -> list:
             data = stream.read(length)
             if len(data) < length:
                 raise EOFError("qstr truncado")
-            stream.read(1)  # descarta terminador nulo
+            stream.read(1)   
             qstrs.append(data.decode("utf-8", errors="replace"))
     return qstrs
 
 
-# ---------------------------------------------------------------------------
-# Parser da tabela de constantes
-# ---------------------------------------------------------------------------
 
 def _parse_const_obj(stream) -> Any:
-    """
-    Lê um objeto constante.
 
-    Byte de tipo (MP_PERSISTENT_OBJ_* de py/persistentcode.h):
-      0  → fun_table (referência interna); retorna None
-      1  → None
-      2  → False
-      3  → True
-      4  → Ellipsis
-      5  → str:     vuint(len) + len bytes UTF-8 + 1 nulo
-      6  → bytes:   vuint(len) + len bytes + 1 nulo
-      7  → int:     vuint(len) + len bytes decimal ASCII (sem nulo)
-      8  → float:   vuint(len) + len bytes ASCII (sem nulo)
-      9  → complex: vuint(len) + len bytes ASCII (sem nulo)
-      10 → tuple:   vuint(n) + n objetos recursivos
-    """
     type_byte = stream.read(1)
     if not type_byte:
         raise EOFError("Fim de arquivo inesperado ao ler tipo de constante")
     t = type_byte[0]
 
-    if t == 0:   return None        # FUN_TABLE
-    if t == 1:   return None        # None
-    if t == 2:   return False       # False
-    if t == 3:   return True        # True
-    if t == 4:   return ...         # Ellipsis
+    if t == 0:   return None       
+    if t == 1:   return None       
+    if t == 2:   return False       
+    if t == 3:   return True        
+    if t == 4:   return ...         
 
-    if t in (5, 6):  # str ou bytes
+    if t in (5, 6): 
         length = _read_vuint(stream)
         data = stream.read(length)
         if len(data) < length:
             raise EOFError("Dado de constante truncado")
-        stream.read(1)  # descarta terminador nulo
+        stream.read(1)  
         return data.decode("utf-8", errors="replace") if t == 5 else data
 
-    if t in (7, 8, 9):  # int, float, complex (sem terminador nulo)
+    if t in (7, 8, 9): 
         length = _read_vuint(stream)
         data = stream.read(length)
         if len(data) < length:
@@ -348,7 +302,7 @@ def _parse_const_obj(stream) -> Any:
         except ValueError:
             return text
 
-    if t == 10:  # tuple
+    if t == 10: 
         n = _read_vuint(stream)
         return tuple(_parse_const_obj(stream) for _ in range(n))
 
@@ -359,38 +313,26 @@ def _parse_const_obj(stream) -> Any:
 
 
 def _parse_const_table(stream, n: int) -> list:
-    """Lê n objetos constantes da tabela global."""
     return [_parse_const_obj(stream) for _ in range(n)]
 
 
-# ---------------------------------------------------------------------------
-# Parser de elemento raw-code (recursivo)
-# ---------------------------------------------------------------------------
 
 def _read_native_extra(stream, kind: int) -> int:
-    """
-    Consome os metadados extras que seguem o fun_data de code objects
-    nativos/viper/asm no formato .mpy v6.
 
-    Retorna o prelude_offset para KIND_NATIVE, -1 para os demais.
-
-    Ref: micropython/py/persistentcode.c — load_raw_code()
-    """
     if kind == KIND_NATIVE:
-        # @micropython.native: 1 vuint (prelude_offset)
         return _read_vuint(stream)
 
     elif kind == KIND_VIPER:
-        # @micropython.viper: scope_flags + optional rodata/bss/relocations
+     
         scope_flags = _read_vuint(stream)
         rodata_size = 0
-        if scope_flags & 0x20:                  # MP_SCOPE_FLAG_VIPERRODATA
+        if scope_flags & 0x20:                  
             rodata_size = _read_vuint(stream)
-        if scope_flags & 0x40:                  # MP_SCOPE_FLAG_VIPERBSS
-            _read_vuint(stream)                 # bss_size (descartado)
+        if scope_flags & 0x40:                 
+            _read_vuint(stream)               
         if scope_flags & 0x20:
-            stream.read(rodata_size)            # rodata bytes
-        if scope_flags & 0x10:                  # MP_SCOPE_FLAG_VIPERRELOC
+            stream.read(rodata_size)         
+        if scope_flags & 0x10:                  
             while True:
                 b = stream.read(1)
                 if not b:
@@ -399,13 +341,11 @@ def _read_native_extra(stream, kind: int) -> int:
                 if op == 0xFF:
                     break
                 if op & 1:
-                    _read_vuint(stream)         # addr
+                    _read_vuint(stream)    
                 op >>= 1
                 if op <= 5 and (op & 1):
-                    _read_vuint(stream)         # n
-
+                    _read_vuint(stream)        
     elif kind == KIND_ASM:
-        # @micropython.asm_*: 3 vuints (scope_flags, n_pos_args, type_sig)
         _read_vuint(stream)
         _read_vuint(stream)
         _read_vuint(stream)
@@ -414,17 +354,7 @@ def _read_native_extra(stream, kind: int) -> int:
 
 
 def _parse_raw_code(stream) -> RawCodeObject:
-    """
-    Lê um elemento raw-code do stream.
 
-    Header vuint: (code_len << 3) | (has_children << 2) | kind
-      kind         : bits 1-0 (0=bytecode, 1=native, 2=viper, 3=asm)
-      has_children : bit 2
-      code_len     : bits restantes (>> 3)
-
-    Para code objects nativos (kind != 0), há metadados extras após os
-    bytes de código que precisam ser consumidos antes dos filhos.
-    """
     hdr = _read_vuint(stream)
     kind         = hdr & 0x03
     has_children = bool((hdr >> 2) & 0x01)
@@ -436,7 +366,6 @@ def _parse_raw_code(stream) -> RawCodeObject:
             f"raw-code truncado: esperado {code_len} bytes, lido {len(code)}"
         )
 
-    # Consome metadados extras de code objects nativos
     prelude_offset = -1
     if kind != KIND_BYTECODE:
         prelude_offset = _read_native_extra(stream, kind)
@@ -451,26 +380,9 @@ def _parse_raw_code(stream) -> RawCodeObject:
                          prelude_offset=prelude_offset)
 
 
-# ---------------------------------------------------------------------------
-# Ponto de entrada público
-# ---------------------------------------------------------------------------
 
 def load_mpy(path: str) -> tuple:
-    """
-    Carrega um arquivo .mpy e retorna seus componentes.
 
-    Retorna:
-        (header, qstr_table, const_table, raw_root)
-
-        header      : dict com version, sub_version, arch_code, arch_name, smallint_bits
-        qstr_table  : list[str] — strings internadas do módulo
-        const_table : list[Any] — objetos constantes globais
-        raw_root    : RawCodeObject — código-raiz (módulo externo)
-
-    Levanta:
-        ValueError  — magic inválido ou versão não suportada
-        EOFError    — arquivo truncado
-    """
     with open(path, "rb") as f:
         header      = _parse_header(f)
         n_qstrs     = _read_vuint(f)
@@ -483,10 +395,7 @@ def load_mpy(path: str) -> tuple:
 
 
 def mpy_info(path: str) -> str:
-    """
-    Retorna uma string legível com os metadados de um .mpy.
-    Útil para debug e para o painel de metadados da UI.
-    """
+
     header, qstrs, consts, root = load_mpy(path)
     arch = header["arch_name"]
     sub  = header["sub_version"]
@@ -499,9 +408,6 @@ def mpy_info(path: str) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# CLI de teste
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
