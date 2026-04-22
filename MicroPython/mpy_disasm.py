@@ -1,39 +1,512 @@
-"""
-Decodificador de opcodes MicroPython — bytecode versão 6.x.
-
-Produz listas de dicts de instrução com o mesmo formato de
-Decompiler/disasm.py, permitindo que cfg.py e stack_sim sejam reutilizados.
-
-Fontes:
-  https://github.com/micropython/micropython/blob/master/py/bc0.h
-  https://github.com/micropython/micropython/blob/master/py/bc.h
-"""
-
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Tabelas de opcodes
-# ---------------------------------------------------------------------------
 
-# Operadores unários (índice = byte - 0xd0)
-# Confirmado via mpy-cross v1.27: pos=0, neg=1, inv=2, not=3
+
 UNARY_OPS = ["+", "-", "~", "not", "abs", "bool", "id"]
 
-# Operadores binários (índice = byte - 0xd7)
-# Confirmado via mpy-cross v1.27 (bc0.h MicroPython 1.27):
-#   0-5  : comparações  <  >  ==  <=  >=  !=
-#   6-8  : in  is  exc_match (interno)
-#   9-21 : in-place |= ^= &= <<= >>= += -= *= @= //= /= %= **=
-#   22-34: binários   |  ^  &  <<  >>  +  -  *  @  //  /  %  **
+
 BINARY_OPS = [
-    # 0-8: comparações + membership + exc_match
     "<", ">", "==", "<=", ">=", "!=", "in", "is", "exc_match",
-    # 9-21: in-place (augmented assignment)
     "|=", "^=", "&=", "<<=", ">>=", "+=", "-=", "*=", "@=", "//=", "/=", "%=", "**=",
-    # 22-34: operadores binários regulares
     "|", "^", "&", "<<", ">>", "+", "-", "*", "@", "//", "/", "%", "**",
 ]
 
+
+_NO_ARG = {
+    0x50: "LOAD_CONST_FALSE",
+    0x51: "LOAD_CONST_NONE",
+    0x52: "LOAD_CONST_TRUE",
+    0x53: "LOAD_NULL",
+    0x54: "LOAD_BUILD_CLASS",
+    0x55: "LOAD_SUBSCR",
+    0x56: "STORE_SUBSCR",
+    0x57: "DUP_TOP",
+    0x58: "DUP_TOP_TWO",
+    0x59: "POP_TOP",
+    0x5a: "ROT_TWO",
+    0x5b: "ROT_THREE",
+    0x5c: "WITH_CLEANUP",
+    0x5d: "END_FINALLY",
+    0x5e: "GET_ITER",
+    0x5f: "GET_ITER_STACK",
+    0x62: "STORE_MAP",
+    0x63: "RETURN_VALUE",
+    0x64: "RAISE_LAST",
+    0x65: "RAISE_OBJ",
+    0x66: "RAISE_FROM",
+    0x67: "YIELD_VALUE",
+    0x68: "YIELD_FROM",
+    0x69: "IMPORT_STAR",
+}
+
+_QSTR_ARG = {
+    0x10: "LOAD_CONST_STRING",
+    0x11: "LOAD_NAME",
+    0x12: "LOAD_GLOBAL",
+    0x13: "LOAD_ATTR",
+    0x14: "LOAD_METHOD",
+    0x15: "LOAD_SUPER_METHOD",
+    0x16: "STORE_NAME",
+    0x17: "STORE_GLOBAL",
+    0x18: "STORE_ATTR",
+    0x19: "DELETE_NAME",
+    0x1a: "DELETE_GLOBAL",
+    0x1b: "IMPORT_NAME",
+    0x1c: "IMPORT_FROM",
+}
+
+
+_UINT_ARG = {
+    0x23: "LOAD_CONST_OBJ",       
+    0x24: "LOAD_FAST_N",           
+    0x25: "LOAD_DEREF",            
+    0x26: "STORE_FAST_N",
+    0x27: "STORE_DEREF",
+    0x28: "DELETE_FAST",
+    0x29: "DELETE_DEREF",
+    0x2a: "BUILD_TUPLE",           
+    0x2b: "BUILD_LIST",
+    0x2c: "BUILD_MAP",
+    0x2d: "BUILD_SET",
+    0x2e: "BUILD_SLICE",
+    0x2f: "STORE_COMP",
+    0x30: "UNPACK_SEQUENCE",
+    0x32: "MAKE_FUNCTION",         
+    0x33: "MAKE_FUNCTION_DEFARGS",
+}
+
+
+_TWO_UINT_ARGS = {
+    0x20: "MAKE_CLOSURE",           
+    0x21: "MAKE_CLOSURE_DEFARGS",
+}
+
+
+_PACKED_UINT_ARG = {
+    0x31: "UNPACK_EX",              
+    0x34: "CALL_FUNCTION",          
+    0x35: "CALL_FUNCTION_VAR_KW",
+    0x36: "CALL_METHOD",
+    0x37: "CALL_METHOD_VAR_KW",
+}
+
+
+_JUMP_ARG = {
+    0x42: "JUMP",
+    0x43: "POP_JUMP_IF_TRUE",
+    0x44: "POP_JUMP_IF_FALSE",
+}
+
+
+_SETUP_JUMP_ARG = {
+    0x45: "JUMP_IF_TRUE_OR_POP",
+    0x46: "JUMP_IF_FALSE_OR_POP",
+    0x47: "SETUP_WITH",
+    0x48: "SETUP_EXCEPT",
+    0x49: "SETUP_FINALLY",
+    0x4a: "POP_EXCEPT_JUMP",
+    0x4b: "FOR_ITER",
+}
+
+
+
+def _read_vuint_b(code: bytes, ip: int) -> tuple:
+
+    result = 0
+    while True:
+        if ip >= len(code):
+            raise EOFError(f"vuint truncado em offset {ip}")
+        b = code[ip]; ip += 1
+        result = (result << 7) | (b & 0x7F)
+        if (b & 0x80) == 0:
+            break
+    return result, ip
+
+
+def _read_signed_vuint_b(code: bytes, ip: int) -> tuple:
+
+    if ip >= len(code):
+        raise EOFError(f"vuint truncado em offset {ip}")
+    first = code[ip]
+    num = -1 if (first & 0x40) else 0
+    while True:
+        if ip >= len(code):
+            raise EOFError(f"vuint truncado em offset {ip}")
+        b = code[ip]; ip += 1
+        num = (num << 7) | (b & 0x7f)
+        if (b & 0x80) == 0:
+            break
+    return num, ip
+
+
+def _read_jump_arg(code: bytes, ip: int) -> tuple:
+
+    if ip >= len(code):
+        raise EOFError(f"argumento de salto truncado em offset {ip}")
+    b1 = code[ip]; ip += 1
+    if (b1 & 0x80) == 0:
+        return b1 - 0x40, ip
+    if ip >= len(code):
+        raise EOFError(f"segundo byte de salto truncado em offset {ip}")
+    b2 = code[ip]; ip += 1
+    return ((b1 & 0x7F) | (b2 << 7)) - 0x4000, ip
+
+
+def _read_ulabel_arg(code: bytes, ip: int) -> tuple:
+
+    if ip >= len(code):
+        raise EOFError(f"argumento ULABEL truncado em offset {ip}")
+    b1 = code[ip]; ip += 1
+    if (b1 & 0x80) == 0:
+        return b1, ip
+    if ip >= len(code):
+        raise EOFError(f"segundo byte ULABEL truncado em offset {ip}")
+    b2 = code[ip]; ip += 1
+    return (b1 & 0x7F) | (b2 << 7), ip
+
+
+def decode_prelude(code: bytes) -> tuple:
+
+    ip = 0
+
+    if ip >= len(code):
+        raise ValueError("bytecode vazio — sem preâmbulo")
+
+    b0 = code[ip]; ip += 1
+    n_state      = (b0 >> 3) & 0x0F   # 4 bits, vale n_state - 1
+    n_exc_stack  = (b0 >> 2) & 0x01   # 1 bit
+    n_pos_args   = b0 & 0x03           # 2 bits
+
+    n_kwonly_args   = 0
+    n_def_pos_args  = 0
+    scope_flags     = 0
+
+
+    ns_shift  = 4  
+    ne_shift  = 1  
+    na_shift  = 2   
+    nk_shift  = 0  
+    sf_shift  = 0  
+    nd_shift  = 0   
+
+
+    if b0 & 0x80:
+        while True:
+            if ip >= len(code):
+                raise ValueError("preâmbulo truncado nos bytes de continuação")
+            b = code[ip]; ip += 1
+
+            n_state     |= ((b >> 4) & 0x03) << ns_shift;  ns_shift += 2
+            n_exc_stack |= ((b >> 1) & 0x01) << ne_shift;  ne_shift += 1
+            n_pos_args  |= ((b >> 2) & 0x01) << na_shift;  na_shift += 1
+            n_kwonly_args  |= ((b >> 3) & 0x01) << nk_shift; nk_shift += 1
+            scope_flags    |= ((b >> 6) & 0x01) << sf_shift; sf_shift += 1
+            n_def_pos_args |= (b & 0x01) << nd_shift;        nd_shift += 1
+
+            if not (b & 0x80):
+                break
+
+    n_state += 1  
+    sig_end = ip
+    n_info = 0
+    n_cell = 0
+    n = 0
+    while True:
+        if ip >= len(code):
+            raise ValueError("preâmbulo truncado nos bytes de size")
+        z = code[ip]; ip += 1
+        n_cell |= (z & 0x01) << n
+        n_info |= ((z & 0x7E) >> 1) << (6 * n)
+        n += 1
+        if not (z & 0x80):
+            break
+
+
+    line_table_start = ip
+    instr_start = ip + n_info + n_cell
+
+    meta = {
+        "n_state":          n_state,
+        "n_exc_stack":      n_exc_stack,
+        "scope_flags":      scope_flags,
+        "n_pos_args":       n_pos_args,
+        "n_kwonly_args":    n_kwonly_args,
+        "n_def_pos_args":   n_def_pos_args,
+        "sig_end":          sig_end,
+        "n_info":           n_info,
+        "n_cell":           n_cell,
+        "line_table_start": line_table_start,
+    }
+    return meta, instr_start
+
+
+def decode_prelude_qstrs(code: bytes, meta: dict, qstrs: list,
+                         is_module: bool = False) -> tuple:
+
+    lt_start = meta["line_table_start"]
+    n_info   = meta["n_info"]
+    info     = code[lt_start : lt_start + n_info]
+
+    if not info:
+        return None, []
+
+    pos = 0
+
+    def _next_vuint():
+        nonlocal pos
+        result = 0
+        while pos < len(info):
+            b = info[pos]; pos += 1
+            result = (result << 7) | (b & 0x7F)
+            if (b & 0x80) == 0:
+                break
+        return result
+
+    def _resolve(idx):
+        return qstrs[idx] if 0 <= idx < len(qstrs) else f"<qstr_{idx}>"
+
+    simple_name_idx = _next_vuint()
+    simple_name = _resolve(simple_name_idx)
+
+    if is_module:
+      
+        _next_vuint()  
+        return simple_name, []
+
+    n_args = meta.get("n_pos_args", 0) + meta.get("n_kwonly_args", 0)
+    arg_names = []
+    for _ in range(n_args):
+        if pos >= len(info):
+            break
+        idx = _next_vuint()
+        arg_names.append(_resolve(idx))
+
+    return simple_name, arg_names
+
+
+def decode_line_table(code: bytes, line_table_start: int, n_info: int) -> dict:
+    line_map = {}
+    bc_offset = 0
+    line_no = 1  
+    ip = line_table_start
+    end = line_table_start + n_info
+
+    while ip < end:
+        b = code[ip]
+
+        if b & 0x80:
+            if ip + 1 >= end:
+                break
+            next_b = code[ip + 1]
+            bc_delta   = b & 0x0F
+            line_delta = ((b & 0x70) << 4) | next_b
+            ip += 2
+        else:
+            bc_delta   = b & 0x1F
+            line_delta = (b >> 5) & 0x03
+            ip += 1
+
+        bc_offset += bc_delta
+        line_no   += line_delta
+        line_map[bc_offset] = line_no
+
+    return line_map
+
+
+
+def _make_instr(offset: int, opcode: int, opname: str,
+                arg: Any, argval: Any, argrepr: str,
+                jump_target=None) -> dict:
+    return {
+        "offset":        offset,
+        "opcode":        opcode,
+        "opname":        opname,
+        "arg":           arg,
+        "argval":        argval,
+        "argrepr":       argrepr,
+        "is_jump_target": False,   
+        "jump_target":   jump_target,
+    }
+
+
+def decode_one(code: bytes, ip: int, qstrs: list, consts: list) -> tuple:
+
+    if ip >= len(code):
+        raise EOFError(f"fim inesperado do bytecode em offset {ip}")
+
+    offset = ip
+    byte   = code[ip]; ip += 1
+
+    if 0x70 <= byte <= 0xaf:
+        val = byte - 0x70 - 16
+        return _make_instr(offset, byte, "LOAD_CONST_SMALL_INT_MULTI",
+                           arg=byte, argval=val, argrepr=repr(val)), ip
+
+    if 0xb0 <= byte <= 0xbf:
+        idx = byte - 0xb0
+        return _make_instr(offset, byte, "LOAD_FAST_MULTI",
+                           arg=byte, argval=idx, argrepr=f"_local_{idx}"), ip
+
+    if 0xc0 <= byte <= 0xcf:
+        idx = byte - 0xc0
+        return _make_instr(offset, byte, "STORE_FAST_MULTI",
+                           arg=byte, argval=idx, argrepr=f"_local_{idx}"), ip
+
+    if 0xd0 <= byte <= 0xd6:
+        op = UNARY_OPS[byte - 0xd0]
+        return _make_instr(offset, byte, "UNARY_OP_MULTI",
+                           arg=byte, argval=op, argrepr=op), ip
+
+    if 0xd7 <= byte <= 0xff:
+        idx = byte - 0xd7
+        op  = BINARY_OPS[idx] if idx < len(BINARY_OPS) else f"binop_{idx}"
+        return _make_instr(offset, byte, "BINARY_OP_MULTI",
+                           arg=byte, argval=op, argrepr=op), ip
+
+
+    if byte in _NO_ARG:
+        opname = _NO_ARG[byte]
+        return _make_instr(offset, byte, opname,
+                           arg=None, argval=None, argrepr=""), ip
+
+
+    if byte == 0x22:
+        val, ip = _read_signed_vuint_b(code, ip)
+        return _make_instr(offset, byte, "LOAD_CONST_SMALL_INT",
+                           arg=val, argval=val, argrepr=repr(val)), ip
+
+
+    if byte in _QSTR_ARG:
+        opname = _QSTR_ARG[byte]
+        idx, ip = _read_vuint_b(code, ip)
+        name = qstrs[idx] if idx < len(qstrs) else f"<qstr_{idx}>"
+        return _make_instr(offset, byte, opname,
+                           arg=idx, argval=name, argrepr=name), ip
+
+
+    if byte in _UINT_ARG:
+        opname = _UINT_ARG[byte]
+        idx, ip = _read_vuint_b(code, ip)
+
+        if byte == 0x23:  
+            val = consts[idx] if idx < len(consts) else f"<const_{idx}>"
+            argval = val; argrepr = repr(val)
+        elif byte in (0x24, 0x26, 0x28): 
+            argval = idx; argrepr = f"_local_{idx}"
+        elif byte in (0x25, 0x27, 0x29):  
+            argval = idx; argrepr = f"_cell_{idx}"
+        else:
+            argval = idx; argrepr = str(idx)
+
+        return _make_instr(offset, byte, opname,
+                           arg=idx, argval=argval, argrepr=argrepr), ip
+
+
+    if byte in _TWO_UINT_ARGS:
+        opname = _TWO_UINT_ARGS[byte]
+        a, ip = _read_vuint_b(code, ip)
+        b, ip = _read_vuint_b(code, ip)
+        argval = (a, b)
+        if byte in (0x20, 0x21):               
+            argrepr = f"child={a}, n_closed={b}"
+        else:
+            argrepr = f"{a}, {b}"
+        return _make_instr(offset, byte, opname,
+                           arg=(a, b), argval=argval, argrepr=argrepr), ip
+
+
+    if byte in _PACKED_UINT_ARG:
+        opname = _PACKED_UINT_ARG[byte]
+        packed, ip = _read_vuint_b(code, ip)
+        a = packed & 0xFF
+        b = (packed >> 8) & 0xFF
+        argval = (a, b)
+        if byte == 0x31:                      
+            argrepr = f"n_before={a}, n_after={b}"
+        else:                              
+            argrepr = f"n_pos={a}, n_kw={b}"
+        return _make_instr(offset, byte, opname,
+                           arg=packed, argval=argval, argrepr=argrepr), ip
+
+ 
+    if byte == 0x40:
+        rel, ip = _read_jump_arg(code, ip)
+        n_unwind, ip = _read_vuint_b(code, ip)
+        target = ip + rel
+        return _make_instr(offset, byte, "UNWIND_JUMP",
+                           arg=(rel, n_unwind), argval=(target, n_unwind),
+                           argrepr=f"target={target}, n_unwind={n_unwind}",
+                           jump_target=target), ip
+
+
+    if byte in _JUMP_ARG:
+        opname = _JUMP_ARG[byte]
+        rel, ip = _read_jump_arg(code, ip)
+        target = ip + rel           # ip aqui = next_ip após consumir o arg
+        return _make_instr(offset, byte, opname,
+                           arg=rel, argval=target,
+                           argrepr=f"to {target}",
+                           jump_target=target), ip
+
+
+    if byte in _SETUP_JUMP_ARG:
+        opname = _SETUP_JUMP_ARG[byte]
+        rel, ip = _read_ulabel_arg(code, ip)
+        target = ip + rel
+        return _make_instr(offset, byte, opname,
+                           arg=rel, argval=target,
+                           argrepr=f"to {target}",
+                           jump_target=target), ip
+
+
+    return _make_instr(offset, byte, f"UNKNOWN_0x{byte:02x}",
+                       arg=None, argval=None, argrepr=""), ip
+
+
+
+
+def parse_mpy_instructions(raw_code, qstrs: list, consts: list) -> tuple:
+
+    code = raw_code.code
+
+    meta, instr_start = decode_prelude(code)
+    line_map = decode_line_table(code, meta["line_table_start"], meta["n_info"])
+
+    instructions = []
+    ip = instr_start
+    while ip < len(code):
+        try:
+            instr, ip = decode_one(code, ip, qstrs, consts)
+        except (EOFError, IndexError) as exc:
+            # bytecode truncado ou mal-formado: encerra graciosamente
+            instructions.append(_make_instr(
+                ip, 0x00, "TRUNCATED", arg=None, argval=None,
+                argrepr=str(exc)
+            ))
+            break
+        instructions.append(instr)
+
+    targets = {
+        instr["jump_target"]
+        for instr in instructions
+        if instr["jump_target"] is not None
+    }
+    for instr in instructions:
+        instr["is_jump_target"] = instr["offset"] in targets
+
+    return meta, instr_start, instructions, line_map
+
+
+def format_instructions(instructions: list, line_map: dict = None) -> str:
+    lines = []
+    for instr in instructions:
+        off  = instr["offset"]
+        lno  = line_map.get(off, "") if line_map else ""
+        mark = ">>" if instr["is_jump_target"] else "  "
+        jt   = f"  (-> {instr['jump_target']})" if instr["jump_target"] is not None else ""
+        line = f"{mark} {off:>4}  {lno:>4}  {instr['opname']:<30} {instr['argrepr']}{jt}"
+        lines.append(line)
+    return "\n".join(lines)
 # Opcodes sem argumento
 _NO_ARG = {
     0x50: "LOAD_CONST_FALSE",
