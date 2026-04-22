@@ -1,11 +1,3 @@
-"""
-Simulação de pilha para bytecode MicroPython (versão 6.x).
-
-Reutiliza utils/ir.py (Expr, Stmt) e utils/block_utils.py.
-Constrói blocos básicos via utils/cfg.build_basic_blocks (sem code_obj).
-CFG: versão própria (terminadores MicroPython + arestas de exceção via SETUP_*).
-"""
-
 from typing import Optional
 
 from utils.ir import Expr, Stmt, expr_repr
@@ -17,51 +9,24 @@ from utils.block_utils import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Terminadores MicroPython
-# ---------------------------------------------------------------------------
-
 _MPY_TERMINATORS = frozenset({
     "JUMP",
     "RETURN_VALUE",
     "RAISE_LAST",
     "RAISE_OBJ",
     "RAISE_FROM",
-    "POP_EXCEPT_JUMP",   # salto forward incondicional (ULABEL) — sem fall-through
+    "POP_EXCEPT_JUMP",   
 })
 
 
-# ---------------------------------------------------------------------------
-# Blocos básicos
-# ---------------------------------------------------------------------------
+
 
 def build_mpy_basic_blocks(instructions: list, debug: bool = False) -> list:
-    """
-    Constrói blocos básicos para bytecode MicroPython.
-    Delega a utils/cfg.build_basic_blocks sem code_obj
-    (omite a exception_entries CPython).
-    """
+
     return build_basic_blocks(instructions, code_obj=None, debug=debug)
 
-
-# ---------------------------------------------------------------------------
-# CFG MicroPython
-# ---------------------------------------------------------------------------
-
 def build_mpy_cfg(blocks: list, instructions: list, debug: bool = False) -> dict:
-    """
-    Constrói o CFG para bytecode MicroPython.
 
-    Arestas normais:
-      - salto explícito (jump_target não-None)
-      - fall-through (bloco seguinte, se não for terminador)
-
-    Arestas de exceção:
-      - SETUP_EXCEPT / SETUP_FINALLY / SETUP_WITH: jump_target → handler block
-        Adiciona aresta do bloco que contém o SETUP_* para o handler.
-
-    Ao contrário do CFG CPython, não usa dis.Bytecode().exception_entries.
-    """
     if not blocks:
         return {}
 
@@ -79,7 +44,6 @@ def build_mpy_cfg(blocks: list, instructions: list, debug: bool = False) -> dict
         last = b["instructions"][-1]
         op = last["opname"]
 
-        # --- aresta de salto explícito ---
         jt = last.get("jump_target")
         if jt is not None and jt in offset_to_block:
             dst = offset_to_block[jt]
@@ -87,20 +51,16 @@ def build_mpy_cfg(blocks: list, instructions: list, debug: bool = False) -> dict
             if debug:
                 print(f"[DEBUG MPY CFG] bloco {src} -> salto -> bloco {dst}")
 
-        # --- terminadores: sem fall-through ---
         if op in _MPY_TERMINATORS:
             if debug:
                 print(f"[DEBUG MPY CFG] bloco {src} termina em {op}")
             continue
-
-        # --- fall-through ---
         if i + 1 < len(blocks):
             dst = blocks[i + 1]["id"]
             cfg[src].add(dst)
             if debug:
                 print(f"[DEBUG MPY CFG] bloco {src} -> fall-through -> bloco {dst}")
 
-    # --- arestas de exceção via SETUP_* ---
     for b in blocks:
         src = b["id"]
         for instr in b["instructions"]:
@@ -117,10 +77,6 @@ def build_mpy_cfg(blocks: list, instructions: list, debug: bool = False) -> dict
 
     return cfg
 
-
-# ---------------------------------------------------------------------------
-# Merge de pilhas (idêntico ao CPython stack_sim)
-# ---------------------------------------------------------------------------
 
 def merge_stacks(stacks: list, debug: bool = False) -> list:
     if not stacks:
@@ -157,10 +113,6 @@ def merge_stacks(stacks: list, debug: bool = False) -> list:
     return merged
 
 
-# ---------------------------------------------------------------------------
-# Emissão de assigns (com detecção de import e augassign)
-# ---------------------------------------------------------------------------
-
 def _emit_assign(stmts: list, target: str, rhs: Expr, off: int):
     if isinstance(rhs, Expr) and rhs.kind == "import":
         stmts.append(Stmt(kind="import", target=target, extra=str(rhs.value), origins=frozenset({off})))
@@ -193,10 +145,6 @@ def _emit_assign(stmts: list, target: str, rhs: Expr, off: int):
     stmts.append(Stmt(kind="assign", target=target, expr=rhs, origins=frozenset({off})))
 
 
-# ---------------------------------------------------------------------------
-# Simulação de instrução individual
-# ---------------------------------------------------------------------------
-
 def simulate_mpy_instruction(
     instr: dict,
     stack: list,
@@ -204,14 +152,7 @@ def simulate_mpy_instruction(
     block_conds: list,
     debug: bool = False,
 ):
-    """
-    Simula o efeito de uma instrução MicroPython na pilha e nos statements.
 
-    Convenções:
-      push(e) — empurra Expr na pilha
-      pop()   — remove e retorna Expr do topo (ou None se vazia)
-      pop_n(n)— remove n itens (TOS primeiro)
-    """
     op  = instr["opname"]
     off = instr["offset"]
 
@@ -237,9 +178,7 @@ def simulate_mpy_instruction(
     def unknown() -> Expr:
         return Expr(kind="unknown", origins=frozenset({off}))
 
-    # ------------------------------------------------------------------
-    # Loads — constantes simples
-    # ------------------------------------------------------------------
+
     if op == "LOAD_CONST_FALSE":
         push(Expr(kind="const", value=False, origins=frozenset({off})))
         return
@@ -272,9 +211,6 @@ def simulate_mpy_instruction(
         push(Expr(kind="name", value="__build_class__", origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Loads — variáveis locais / closure / globais
-    # ------------------------------------------------------------------
     if op in ("LOAD_FAST_N", "LOAD_FAST_MULTI"):
         name = instr.get("argrepr") or f"_local_{instr.get('argval', '?')}"
         push(Expr(kind="name", value=name, origins=frozenset({off})))
@@ -289,20 +225,28 @@ def simulate_mpy_instruction(
         push(Expr(kind="name", value=instr.get("argval"), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Loads — atributos e subscripts
-    # ------------------------------------------------------------------
     if op == "LOAD_ATTR":
         obj = pop() or unknown()
         push(Expr(kind="attr", value=instr.get("argval"), args=(obj,), origins=frozenset({off})))
         return
 
-    if op in ("LOAD_METHOD", "LOAD_SUPER_METHOD"):
+    if op == "LOAD_METHOD":
         obj = pop() or unknown()
         attr = instr.get("argval")
-        # LOAD_METHOD empurra: null + método (como CPython)
         push(Expr(kind="null", origins=frozenset({off})))
         push(Expr(kind="attr", value=attr, args=(obj,), origins=frozenset({off})))
+        return
+
+    if op == "LOAD_SUPER_METHOD":
+        pop()  
+        pop()  
+        pop()  
+        attr = instr.get("argval")
+        super_call = Expr(kind="call",
+                          args=(Expr(kind="name", value="super", origins=frozenset({off})),),
+                          origins=frozenset({off}))
+        push(Expr(kind="null", origins=frozenset({off})))
+        push(Expr(kind="attr", value=attr, args=(super_call,), origins=frozenset({off})))
         return
 
     if op == "LOAD_SUBSCR":
@@ -311,9 +255,6 @@ def simulate_mpy_instruction(
         push(Expr(kind="subscr", args=(obj, key), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Stores — variáveis
-    # ------------------------------------------------------------------
     if op in ("STORE_FAST_N", "STORE_FAST_MULTI"):
         target = instr.get("argrepr") or f"_local_{instr.get('argval', '?')}"
         rhs = pop() or unknown()
@@ -344,17 +285,28 @@ def simulate_mpy_instruction(
         return
 
     if op == "STORE_SUBSCR":
-        obj  = pop() or unknown()
-        key  = pop() or unknown()
-        val  = pop() or unknown()
+        key  = pop() or unknown()  
+        obj  = pop() or unknown()  
+        val  = pop() or unknown()   
         target_repr = f"{expr_repr(obj)}[{expr_repr(key)}]"
-        stmts.append(Stmt(kind="store_subscr", target=target_repr, expr=val, origins=frozenset({off})))
+
+        if isinstance(val, Expr) and val.kind == "null":
+            stmts.append(Stmt(kind="del_subscr", target=target_repr, origins=frozenset({off})))
+        else:
+            stmts.append(Stmt(kind="store_subscr", target=target_repr, expr=val, origins=frozenset({off})))
+        return
+
+    if op == "DELETE_SUBSCR":
+
+        key = pop() or unknown()  
+        obj = pop() or unknown()  
+        target_repr = f"{expr_repr(obj)}[{expr_repr(key)}]"
+        stmts.append(Stmt(kind="del_subscr", target=target_repr, origins=frozenset({off})))
         return
 
     if op == "STORE_MAP":
-        # Stack antes: [..., dict, key, val]  — TOS = val, TOS1 = key, TOS2 = dict
-        val = pop() or unknown()
         key = pop() or unknown()
+        val = pop() or unknown()
         if stack and isinstance(stack[-1], Expr) and stack[-1].kind == "dict":
             d = stack[-1]
             stack[-1] = Expr(kind="dict", args=tuple(d.args) + (key, val),
@@ -362,25 +314,17 @@ def simulate_mpy_instruction(
         return
 
     if op == "STORE_COMP":
-        # Emite elemento como Stmt "store_comp" para ser capturado pelo fixup de
-        # comprehension em mpy_extract.py.
-        # O tipo de acumulador (list/dict/set) é determinado por stack[0].kind.
         acc_kind = stack[0].kind if stack else "list"
         if acc_kind == "dict":
-            # dictcomp: TOS = key, TOS-1 = value
             key   = pop() or unknown()
             value = pop() or unknown()
             pair  = Expr(kind="pair", args=(value, key), origins=frozenset({off}))
             stmts.append(Stmt(kind="store_comp", expr=pair, origins=frozenset({off})))
         else:
-            # listcomp ou setcomp: TOS = element
             item = pop() or unknown()
             stmts.append(Stmt(kind="store_comp", expr=item, origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Deletes
-    # ------------------------------------------------------------------
     if op in ("DELETE_FAST", "DELETE_DEREF"):
         target = instr.get("argrepr") or str(instr.get("argval", "?"))
         stmts.append(Stmt(kind="del", target=target, origins=frozenset({off})))
@@ -390,10 +334,6 @@ def simulate_mpy_instruction(
         target = str(instr.get("argval"))
         stmts.append(Stmt(kind="del", target=target, origins=frozenset({off})))
         return
-
-    # ------------------------------------------------------------------
-    # Manipulação de pilha
-    # ------------------------------------------------------------------
     if op == "DUP_TOP":
         push(stack[-1] if stack else unknown())
         return
@@ -411,7 +351,6 @@ def simulate_mpy_instruction(
         v = pop()
         if v is None:
             return
-        # Suprime valores internos (iteradores, sentinelas, etc.)
         if isinstance(v, Expr) and v.kind in (
             "iter", "next", "null", "exc", "exc_match",
             "with_enter", "with_exit", "with_cleanup",
@@ -433,9 +372,6 @@ def simulate_mpy_instruction(
             stack[-3] = tos
         return
 
-    # ------------------------------------------------------------------
-    # Operadores binários e unários (multi-opcode ranges)
-    # ------------------------------------------------------------------
     if op == "BINARY_OP_MULTI":
         b_val = pop() or unknown()
         a_val = pop() or unknown()
@@ -449,11 +385,8 @@ def simulate_mpy_instruction(
         push(Expr(kind="unary", value=sym, args=(val,), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Saltos condicionais (registra condição; CFG cuida do fluxo)
-    # ------------------------------------------------------------------
     if op == "JUMP":
-        return  # incondicional, sem efeito na pilha
+        return 
 
     if op in ("POP_JUMP_IF_TRUE", "POP_JUMP_IF_FALSE"):
         cond = pop()
@@ -462,7 +395,6 @@ def simulate_mpy_instruction(
         return
 
     if op in ("JUMP_IF_TRUE_OR_POP", "JUMP_IF_FALSE_OR_POP"):
-        # Peek: mantém TOS se o salto for tomado
         cond = stack[-1] if stack else None
         if cond is not None:
             block_conds.append(cond)
@@ -471,29 +403,23 @@ def simulate_mpy_instruction(
     if op == "UNWIND_JUMP":
         return
 
-    # ------------------------------------------------------------------
-    # Iteração
-    # ------------------------------------------------------------------
+
     if op == "GET_ITER":
         src = pop() or unknown()
         push(Expr(kind="iter", args=(src,), origins=frozenset({off})))
         return
 
     if op == "GET_ITER_STACK":
-        # Converte TOS (já na pilha) em iterador
         src = pop() or unknown()
         push(Expr(kind="iter", args=(src,), origins=frozenset({off})))
         return
 
     if op == "FOR_ITER":
-        # Peek no iterador; empurra próximo valor
         it = stack[-1] if stack else unknown()
         push(Expr(kind="next", args=(it,), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Coleções
-    # ------------------------------------------------------------------
+
     if op == "BUILD_TUPLE":
         n = instr.get("argval") or 0
         elems = list(reversed(pop_n(n)))
@@ -507,8 +433,6 @@ def simulate_mpy_instruction(
         return
 
     if op == "BUILD_MAP":
-        # MicroPython: BUILD_MAP 0 cria dict vazio; pares adicionados por STORE_MAP
-        # (diferente do CPython BUILD_MAP n que pop 2n itens)
         push(Expr(kind="dict", args=(), origins=frozenset({off})))
         return
 
@@ -552,9 +476,6 @@ def simulate_mpy_instruction(
                 push(Expr(kind="unpack", value=i, args=(seq,), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Funções e closures
-    # ------------------------------------------------------------------
     if op == "MAKE_FUNCTION":
         child_idx = instr.get("argval") or 0
         push(Expr(kind="make_function", value=child_idx,
@@ -587,9 +508,7 @@ def simulate_mpy_instruction(
                   args=(defaults, None, None, closure_tup), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Chamadas de função / método
-    # ------------------------------------------------------------------
+
     if op in ("CALL_FUNCTION", "CALL_FUNCTION_VAR_KW",
               "CALL_METHOD",   "CALL_METHOD_VAR_KW"):
 
@@ -599,27 +518,35 @@ def simulate_mpy_instruction(
         has_var_kw = op in ("CALL_FUNCTION_VAR_KW", "CALL_METHOD_VAR_KW")
         is_method  = op in ("CALL_METHOD",          "CALL_METHOD_VAR_KW")
 
-        # **kwargs dict no topo (se variante VAR_KW)
-        kwargs_dict = pop() if has_var_kw else None
-
-        # Pares de keyword args (n_kw pares key/val; key é constante string)
+        star_flag_expr = pop() if has_var_kw else None
         kw_args = []
+        double_kwargs = None
         for _ in range(n_kw):
             val = pop() or unknown()
             key = pop() or unknown()
+            if isinstance(key, Expr) and key.kind == "null":
+                if double_kwargs is None:
+                    double_kwargs = val
+                    continue
             kw_args.insert(0, (key, val))
 
-        # Args posicionais
         pos_args = list(reversed(pop_n(n_pos)))
 
-        # Callable (TOS após args)
+        star_args = None
+        if has_var_kw:
+            flag_val = None
+            if isinstance(star_flag_expr, Expr) and star_flag_expr.kind == "const":
+                fv = star_flag_expr.value
+                if isinstance(fv, int):
+                    flag_val = fv
+            if flag_val is not None and (flag_val & 1) and pos_args:
+                star_args = pos_args.pop()
+
         fn = pop() or unknown()
 
-        # CALL_METHOD: receiver ou NULL abaixo do callable
         if is_method:
-            pop()  # descarta null/receiver (já embutido no attr expr)
+            pop() 
 
-        # Monta lista de args para Expr call
         all_args = [fn] + pos_args
         for k, v in kw_args:
             kw_name = (
@@ -629,15 +556,15 @@ def simulate_mpy_instruction(
             )
             all_args.append(Expr(kind="kwarg", value=kw_name, args=(v,), origins=frozenset({off})))
 
-        if kwargs_dict is not None:
-            all_args.append(Expr(kind="double_starred", args=(kwargs_dict,), origins=frozenset({off})))
+        if star_args is not None:
+            all_args.append(Expr(kind="starred", args=(star_args,), origins=frozenset({off})))
+
+        if double_kwargs is not None:
+            all_args.append(Expr(kind="double_starred", args=(double_kwargs,), origins=frozenset({off})))
 
         push(Expr(kind="call", args=tuple(all_args), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Return / Yield
-    # ------------------------------------------------------------------
     if op == "RETURN_VALUE":
         val = pop()
         push(Expr(kind="return_value", args=(val,), origins=frozenset({off})))
@@ -649,32 +576,25 @@ def simulate_mpy_instruction(
         return
 
     if op == "YIELD_FROM":
-        # MicroPython: protocolo "yield from" como single opcode
-        # TOS = send_val (valor a enviar ao sub-gerador), TOS1 = sub-gerador / iterável
-        pop()  # descarta send_val (TOS)
-        subgen = pop() or unknown()  # sub-gerador (TOS1)
-        # Desfaz iter() wrapping: GET_ITER antes de YIELD_FROM é artefato do bytecode
+
+        pop() 
+        subgen = pop() or unknown() 
         if isinstance(subgen, Expr) and subgen.kind == "iter" and subgen.args:
             subgen = subgen.args[0]
         stmts.append(Stmt(kind="yield_from", expr=subgen, origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Exceções
-    # ------------------------------------------------------------------
     if op in ("SETUP_EXCEPT", "SETUP_FINALLY"):
-        # Configura handler; sem efeito imediato na pilha
         return
 
     if op == "SETUP_WITH":
-        # TOS = context manager; empurra __exit__ + resultado de __enter__()
         ctx = pop() or unknown()
         push(Expr(kind="with_exit",  args=(ctx,), origins=frozenset({off})))
         push(Expr(kind="with_enter", args=(ctx,), origins=frozenset({off})))
         return
 
     if op == "POP_EXCEPT_JUMP":
-        pop()  # remove exceção do topo
+        pop() 
         return
 
     if op == "WITH_CLEANUP":
@@ -706,9 +626,6 @@ def simulate_mpy_instruction(
         stack.clear()
         return
 
-    # ------------------------------------------------------------------
-    # Import
-    # ------------------------------------------------------------------
     if op == "IMPORT_NAME":
         fromlist    = pop() or unknown()
         level       = pop() or unknown()
@@ -728,16 +645,10 @@ def simulate_mpy_instruction(
         stmts.append(Stmt(kind="import_star", target=str(module_name), origins=frozenset({off})))
         return
 
-    # ------------------------------------------------------------------
-    # Fallback: opcode não reconhecido
-    # ------------------------------------------------------------------
+
     if debug:
         print(f"[DEBUG MPY INSTR] Opcode não tratado: {op} @ offset {off}")
 
-
-# ---------------------------------------------------------------------------
-# Simulação principal (algoritmo de ponto-fixo)
-# ---------------------------------------------------------------------------
 
 def simulate_mpy_stack(
     blocks: list,
@@ -747,28 +658,11 @@ def simulate_mpy_stack(
     debug: bool = False,
     max_iters: int = 2000,
 ) -> dict:
-    """
-    Simulação de pilha com fixpoint para bytecode MicroPython.
 
-    Parâmetros:
-        blocks       — lista de blocos básicos (de build_mpy_basic_blocks)
-        cfg          — dicionário de arestas (de build_mpy_cfg)
-        instructions — lista de instruções (de parse_mpy_instructions)
-        code_obj     — MpyCodeObject (usado só para logs)
-        debug        — ativa saída [DEBUG]
-        max_iters    — limite de iterações do fixpoint
-
-    Retorna dict com:
-        "in_stack"         — {bid: list[Expr]}
-        "out_stack"        — {bid: list[Expr]}
-        "block_statements" — {bid: list[Stmt]}
-        "block_conditions" — {bid: list[Expr]}
-    """
     if debug:
         name = getattr(code_obj, "co_name", "<?>")
         print(f"[DEBUG MPY] Simulando pilha de '{name}' ({len(blocks)} blocos)")
 
-    # --- fingerprint de pilha (para detecção de convergência) ---
     def expr_key(e, depth=4):
         if e is None:
             return ("none",)
@@ -847,34 +741,38 @@ def simulate_mpy_stack(
                 simulate_mpy_instruction(instr, cur_stack, stmts, conds, debug=False)
 
             ops_in_block = {ins["opname"] for ins in block.get("instructions", [])}
+            ret_exprs = [v for v in cur_stack
+                         if isinstance(v, Expr) and v.kind == "return_value"]
 
-            # --- materialização de RETURN_VALUE ---
-            ret_expr = None
-            for v in reversed(cur_stack):
-                if isinstance(v, Expr) and v.kind == "return_value":
-                    ret_expr = v
-                    break
-
-            if ret_expr is not None:
+            if ret_exprs:
                 is_loop_cleanup = block.get("loop_after") is not None
-                val     = ret_expr.args[0] if ret_expr.args else None
+                block_ops = [ins["opname"] for ins in block["instructions"]]
+                has_real_stmt = any(s.kind not in ("del",) for s in stmts)
+                chosen = None
+                for ret_expr in ret_exprs:
+                    val = ret_expr.args[0] if ret_expr.args else None
+                    is_none = (
+                        val is None
+                        or (isinstance(val, Expr) and val.kind == "const" and val.value is None)
+                    )
+                    if not is_none:
+                        chosen = ret_expr
+                        break
+                if chosen is None:
+                    chosen = ret_exprs[0]
+
+                val = chosen.args[0] if chosen.args else None
                 is_none = (
                     val is None
                     or (isinstance(val, Expr) and val.kind == "const" and val.value is None)
                 )
-                has_real_stmt = any(s.kind not in ("del",) for s in stmts)
-
-                # Detecta epílogo implícito: bloco cujas únicas instruções
-                # são LOAD_CONST_NONE + RETURN_VALUE (return None implícito
-                # adicionado pelo compilador MicroPython a toda função)
-                block_ops = [ins["opname"] for ins in block["instructions"]]
                 is_epilogue = is_none and block_ops == ["LOAD_CONST_NONE", "RETURN_VALUE"]
 
                 if not is_loop_cleanup:
                     if not is_none:
-                        stmts.append(Stmt(kind="return", expr=val, origins=ret_expr.origins))
-                    elif not has_real_stmt and not is_epilogue:
-                        stmts.append(Stmt(kind="return", expr=val, origins=ret_expr.origins))
+                        stmts.append(Stmt(kind="return", expr=val, origins=chosen.origins))
+                    elif not is_epilogue:
+                        stmts.append(Stmt(kind="return", expr=val, origins=chosen.origins))
 
                 cur_stack = [
                     v for v in cur_stack
@@ -884,7 +782,6 @@ def simulate_mpy_stack(
             block_statements[bid] = stmts
             block_conditions[bid] = conds
 
-            # --- terminação ---
             terminated = (
                 bool(ops_in_block & _MPY_TERMINATORS)
                 or any(s.kind in ("return", "raise") for s in stmts)
@@ -905,9 +802,199 @@ def simulate_mpy_stack(
     if debug:
         print(f"[DEBUG MPY] Fixpoint convergiu em {it} iterações")
 
+    _fix_mpy_short_circuit(
+        blocks, cfg, block_statements, block_conditions,
+        in_stack, out_stack, debug=debug,
+    )
+
     return {
         "in_stack":         in_stack,
         "out_stack":        out_stack,
         "block_statements": block_statements,
         "block_conditions": block_conditions,
     }
+
+
+def _fix_mpy_short_circuit(
+    blocks, cfg, block_statements, block_conditions,
+    in_stack, out_stack, debug=False,
+):
+
+    block_by_id = build_block_by_id(blocks)
+    offset_to_block = build_offset_to_block(blocks)
+
+    def _subst_expr(e, old_obj, new_expr):
+        if e is None or not isinstance(e, Expr):
+            return e
+        if e is old_obj:
+            return new_expr
+        if not e.args:
+            return e
+        new_args = tuple(_subst_expr(a, old_obj, new_expr) for a in e.args)
+        if any(na is not e.args[i] for i, na in enumerate(new_args)):
+            return Expr(kind=e.kind, value=e.value, args=new_args, origins=e.origins)
+        return e
+
+    def _subst_stmt(s, old_obj, new_expr):
+        if not isinstance(s, Stmt):
+            return s
+        new_e = _subst_expr(s.expr, old_obj, new_expr) if s.expr is not None else s.expr
+        new_x = _subst_expr(s.extra, old_obj, new_expr) if isinstance(s.extra, Expr) else s.extra
+        if new_e is s.expr and new_x is s.extra:
+            return s
+        return Stmt(kind=s.kind, target=s.target, expr=new_e, extra=new_x, origins=s.origins)
+
+    def _subst_everywhere(old_obj, new_expr, skip_bid=None):
+        for bid2 in list(in_stack.keys()):
+            if bid2 == skip_bid:
+                continue
+            in_stack[bid2] = [_subst_expr(v, old_obj, new_expr) for v in in_stack[bid2]]
+        for bid2 in list(out_stack.keys()):
+            if bid2 == skip_bid:
+                continue
+            out_stack[bid2] = [_subst_expr(v, old_obj, new_expr) for v in out_stack[bid2]]
+        for bid2 in list(block_statements.keys()):
+            if bid2 == skip_bid:
+                continue
+            block_statements[bid2] = [
+                _subst_stmt(s, old_obj, new_expr) for s in (block_statements[bid2] or [])
+            ]
+        for bid2 in list(block_conditions.keys()):
+            if bid2 == skip_bid:
+                continue
+            block_conditions[bid2] = [
+                _subst_expr(v, old_obj, new_expr) for v in (block_conditions[bid2] or [])
+            ]
+
+    sc_items = []  
+    for b in blocks:
+        bid = b["id"]
+        instrs = b.get("instructions", []) or []
+        if not instrs:
+            continue
+        last = instrs[-1]
+        op_last = last.get("opname", "")
+        if op_last not in ("JUMP_IF_TRUE_OR_POP", "JUMP_IF_FALSE_OR_POP"):
+            continue
+        op = "or" if op_last == "JUMP_IF_TRUE_OR_POP" else "and"
+        jump_off = last.get("jump_target")
+        jump_bid = offset_to_block.get(jump_off) if jump_off is not None else None
+        succs = list(cfg.get(bid, set()))
+        fall_bid = next((s for s in succs if s != jump_bid), None)
+        if fall_bid is None:
+            continue
+        primary_merge = jump_bid if jump_bid is not None else 10**9
+        sc_items.append((bid, op, jump_bid, fall_bid, primary_merge))
+
+    sc_items.sort(key=lambda t: (t[4], -t[0]))
+
+    for bid, op, jump_bid, fall_bid, primary_merge in sc_items:
+        a_stack = out_stack.get(bid, [])
+        b_stack = out_stack.get(fall_bid, [])
+        if not a_stack:
+            continue
+        a_val = a_stack[-1]
+        b_val = b_stack[-1] if b_stack else None
+        if b_val is None:
+            for s in reversed(block_statements.get(fall_bid, []) or []):
+                if isinstance(s, Stmt) and s.kind == "return" and s.expr is not None:
+                    b_val = s.expr
+                    break
+        if a_val is None or b_val is None:
+            continue
+
+        sc_expr = Expr(kind="binop", value=op, args=(a_val, b_val), origins=frozenset())
+
+        fall_succs = set(cfg.get(fall_bid, set()))
+        candidates = fall_succs | ({jump_bid} if jump_bid is not None else set())
+
+        patched_any = False
+        a_repr = expr_repr(a_val)
+        b_repr = expr_repr(b_val)
+
+        for merge_bid in candidates:
+            merge_in = in_stack.get(merge_bid, [])
+            if not merge_in:
+                continue
+
+            old_obj = None
+            new_merge = list(merge_in)
+            for i, v in enumerate(new_merge):
+                if not (isinstance(v, Expr) and v.kind == "phi"):
+                    continue
+                phi_args = v.args or ()
+                phi_reprs = [expr_repr(x) for x in phi_args]
+                if a_repr in phi_reprs or b_repr in phi_reprs:
+                    old_obj = v
+                    new_merge[i] = sc_expr
+                    break
+
+            if old_obj is None and new_merge:
+                tos = new_merge[-1]
+                if expr_repr(tos) == b_repr:
+                    old_obj = tos
+                    new_merge[-1] = sc_expr
+
+            if old_obj is None:
+                continue
+
+            in_stack[merge_bid] = new_merge
+            merge_b = block_by_id.get(merge_bid, {})
+            new_stmts = []
+            new_conds = []
+            cur_stk = list(new_merge)
+            for instr in merge_b.get("instructions", []) or []:
+                simulate_mpy_instruction(instr, cur_stk, new_stmts, new_conds, debug=False)
+            ret_expr = None
+            for v in cur_stk[::-1]:
+                if isinstance(v, Expr) and v.kind == "return_value":
+                    ret_expr = v
+                    break
+            if ret_expr is not None:
+                val = ret_expr.args[0] if ret_expr.args else None
+                is_none = (
+                    val is None
+                    or (isinstance(val, Expr) and val.kind == "const" and val.value is None)
+                )
+                if not is_none:
+                    new_stmts.append(Stmt(kind="return", expr=val, origins=ret_expr.origins))
+                elif not any(s.kind not in ("del",) for s in new_stmts):
+                    new_stmts.append(Stmt(kind="return", expr=val, origins=ret_expr.origins))
+            block_statements[merge_bid] = new_stmts
+            block_conditions[merge_bid] = new_conds
+            out_stack[merge_bid] = [
+                v for v in cur_stk if not (isinstance(v, Expr) and v.kind == "return_value")
+            ]
+
+            _subst_everywhere(old_obj, sc_expr, skip_bid=merge_bid)
+
+            patched_any = True
+            if debug:
+                print(f"[DEBUG MPY] short-circuit {op}: patched em bloco {merge_bid}")
+            break 
+
+        if not patched_any and jump_bid is not None:
+            jump_stmts = block_statements.get(jump_bid, []) or []
+            fall_stmts = block_statements.get(fall_bid, []) or []
+
+            def _last_return(stmts_list):
+                for s in reversed(stmts_list):
+                    if isinstance(s, Stmt) and s.kind == "return":
+                        return s
+                return None
+
+            jump_ret = _last_return(jump_stmts)
+            fall_ret = _last_return(fall_stmts)
+            if jump_ret is not None and fall_ret is not None:
+                jump_ret_repr = expr_repr(jump_ret.expr) if jump_ret.expr is not None else ""
+                fall_ret_repr = expr_repr(fall_ret.expr) if fall_ret.expr is not None else ""
+                if jump_ret_repr == a_repr and fall_ret_repr == b_repr:
+                    new_ret = Stmt(kind="return", expr=sc_expr, origins=jump_ret.origins)
+                    block_statements[jump_bid] = (
+                        [s for s in jump_stmts if s is not jump_ret] + [new_ret]
+                    )
+                    if debug:
+                        print(
+                            f"[DEBUG MPY] short-circuit {op}: combined returns"
+                            f" jump={jump_bid} fall={fall_bid}"
+                        )
