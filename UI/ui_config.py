@@ -1,5 +1,3 @@
-# ================= CONFIGURAÇÃO =================
-
 from pathlib import Path
 
 ENGINE_PYTHON = "python3.12"
@@ -13,15 +11,13 @@ APP_TITLE = "Python Decompiler"
 SUPPORTED_VERSIONS = ["3.12"]
 SUPPORTED_HINT = "Compatível apenas com: " + ", ".join(SUPPORTED_VERSIONS)
 
-# Formatos suportados
+
 SUPPORTED_EXTENSIONS = [".pyc", ".mpy"]
 FILE_FILTER          = "Bytecode Files (*.pyc *.mpy)"
 
-# Caminho do engine MicroPython (usado pelo mpy_engine_runner)
 _UI_DIR        = Path(__file__).parent
 _PROJECT_ROOT  = _UI_DIR.parent
 MPY_ENGINE_PATH = _PROJECT_ROOT / "MicroPython" / "mpy_engine.py"
 
-# Layout
 GUTTER     = 10
 LEFT_WIDTH = 320
