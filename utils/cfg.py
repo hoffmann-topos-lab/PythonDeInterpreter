@@ -9,9 +9,6 @@ def build_basic_blocks(instructions, code_obj=None, debug=True):
     if debug:
         print("[DEBUG] Iniciando construção de blocos básicos (3.11/3.12)")
 
-    # ---------------------------
-    # 1) identificar líderes
-    # ---------------------------
     leaders = {instructions[0]["offset"]}
 
     for i, instr in enumerate(instructions):
@@ -39,27 +36,21 @@ def build_basic_blocks(instructions, code_obj=None, debug=True):
     if debug:
         print(f"[DEBUG] Líderes identificados: {sorted(leaders)}")
 
-    # ---------------------------
-    # 2) construir blocos + contexto de loop
-    # ---------------------------
+
     blocks = []
     current = None
     bid = 0
-
-    # pilha de after-loop offsets (target do FOR_ITER)
     loop_stack = []
 
     for ins in instructions:
         off = ins["offset"]
 
-        # PATCH CRÍTICO:
-        # se chegamos exatamente no after-loop, saímos do loop ANTES de iniciar o bloco
+
         while loop_stack and off == loop_stack[-1]:
             exited = loop_stack.pop()
             if debug:
                 print(f"[DEBUG] Saída de loop detectada em offset {off} (after-loop={exited})")
 
-        # inicia novo bloco se for leader
         if off in leaders:
             if current is not None:
                 blocks.append(current)
@@ -86,7 +77,7 @@ def build_basic_blocks(instructions, code_obj=None, debug=True):
         current["instructions"].append(ins)
         current["end_offset"] = off
 
-        # entrada em loop FOR
+
         if ins["opname"] == "FOR_ITER" and ins.get("jump_target") is not None:
             loop_after = ins["jump_target"]
             loop_stack.append(loop_after)
@@ -113,7 +104,6 @@ def build_cfg(blocks, instructions, code_obj, debug=True):
         print("[DEBUG] Iniciando construção do CFG")
         print(f"[DEBUG] CFG para code object: {getattr(code_obj, 'co_name', '<none>')}")
 
-    # map offset -> block id
     offset_to_block = {}
     for b in blocks:
         for ins in b["instructions"]:
@@ -129,20 +119,16 @@ def build_cfg(blocks, instructions, code_obj, debug=True):
         "JUMP_BACKWARD_NO_INTERRUPT",
         "JUMP_NO_INTERRUPT",
         "JUMP",
-        "POP_EXCEPT_JUMP",       # MicroPython: salto forward incondicional (ULABEL)
+        "POP_EXCEPT_JUMP",      
     }
 
     RETURN_OPS = {"RETURN_VALUE", "RETURN_CONST"}
 
-    # ----------------------------
-    # Arestas normais
-    # ----------------------------
     for i, b in enumerate(blocks):
         src = b["id"]
         last = b["instructions"][-1]
         op = last["opname"]
 
-        # salto explícito
         jt = last.get("jump_target")
         if jt is not None and jt in offset_to_block:
             dst = offset_to_block[jt]
@@ -150,13 +136,11 @@ def build_cfg(blocks, instructions, code_obj, debug=True):
             if debug:
                 print(f"[DEBUG] CFG: bloco {src} -> salto para bloco {dst}")
 
-        # RETURN real (fora de loop): encerra
         if op in RETURN_OPS and b.get("loop_after") is None:
             if debug:
                 print(f"[DEBUG] CFG: bloco {src} RETURN real (exit)")
             continue
 
-        # RETURN estrutural (break em for 3.11+): vai para after-loop
         if op in RETURN_OPS and b.get("loop_after") is not None:
             after = b["loop_after"]
             dst = offset_to_block.get(after)
@@ -166,11 +150,9 @@ def build_cfg(blocks, instructions, code_obj, debug=True):
                     print(f"[DEBUG] CFG: bloco {src} break -> after-loop bloco {dst}")
             continue
 
-        # terminadores sem fall-through
         if op in TERMINATORS:
             continue
 
-        # fall-through normal
         if i + 1 < len(blocks):
             dst = blocks[i + 1]["id"]
             cfg[src].add(dst)
@@ -180,9 +162,6 @@ def build_cfg(blocks, instructions, code_obj, debug=True):
     if code_obj is None:
         return cfg
 
-    # ----------------------------
-    # Arestas de exceção (3.11+)
-    # ----------------------------
     try:
         entries = list(dis.Bytecode(code_obj).exception_entries)
     except Exception:
@@ -201,11 +180,8 @@ def build_cfg(blocks, instructions, code_obj, debug=True):
         if debug:
             print(f"[DEBUG] Exception entry: range [{e.start}, {e.end}) -> handler {handler_bid}")
 
-        # adiciona arestas de exceção: blocos protegidos -> handler
         for b in blocks:
             bid = b["id"]
-
-            # PATCH CRÍTICO: não criar self-loop do handler
             if bid == handler_bid:
                 continue
 
