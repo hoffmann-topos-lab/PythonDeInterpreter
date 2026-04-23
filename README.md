@@ -28,14 +28,29 @@ venv/bin/pip install mpy-cross
 | CPython bytecode | 3.12 | `.pyc` |
 | MicroPython bytecode | v6.x (mpy-cross v1.27) | `.mpy` |
 
+### Recovered Python Syntax
+
+The decompiler recognizes and reconstructs:
+
+- **Match/case statements** (PEP 634) — literal, sequence, mapping, and class patterns
+- **Walrus operator** (`:=`) in conditionals and comprehensions
+- **Async constructs** — `async def`, `async with`, `async for`, and async comprehensions
+- **Exception groups** (PEP 654) — `except*` blocks via `EXC_GROUP_MATCH`
+- **Function and class decorators**
+- **Chained comparisons** 
+
+- **Lambda expressions** and **generator expressions**
+- **Nested comprehensions** with multiple `for`/`if` clauses
+- **Closure / cell variables** for nested scopes
+
 ### Native Code Architectures (`.mpy` only)
 
 Functions compiled with `@micropython.native` or `@micropython.viper` are disassembled into readable assembly. Supported architectures:
 
 - **x86 / x64**
-- **ARM Thumb / Thumb-2** (armv6m, armv7m, armv7em, armv7emsp, armv7emdp)
+- **ARM Thumb / Thumb-2** (armv6m, armv7m, armv7em, armv7emsp, armv7emdp — RP2040, RP2350, STM32)
 - **Xtensa** (ESP8266 CALL0 ABI, ESP32 windowed ABI)
-- **RISC-V** (RV32IMC / RV64IMC)
+- **RISC-V** (RV32IMC for ESP32-C3/C6, RV64IMC)
 
 ## Usage
 
@@ -47,18 +62,32 @@ Launch the GUI to open, inspect, and navigate decompiled bytecode:
 venv/bin/python main.py
 ```
 
-The interface has three panels:
+The interface has three main panels:
 
 1. **Left panel** — lists strings, functions, constants, and exception handlers found in the bytecode
 2. **Center panel** — displays the raw bytecode disassembly
 3. **Right panel** — shows the recovered Python source code
 
-Additional GUI features(BETA):
-- **Annotations** — rename variables/functions and add comments, saved alongside the binary as `.annotations.json`
-- **CFG Viewer** — visualize the control flow graph of any function
-- **Diff View** — compare decompilations of two files side by side
-- **Statistics** — opcode distribution, import list, and general metrics
-- **Python Console** — interactive console with access to the current session's data
+A toggleable **Hex Dump panel** (bottom-left, *Visualizar → Painel Hex Dump*) shows the raw bytes of the loaded file.
+
+#### Menus
+
+- **Arquivo** — Abrir (`Ctrl+O`), Recarregar (`Ctrl+R`), Salvar código (`Ctrl+S`), Bin Diff (`Ctrl+D`), Arquivos recentes, Fechar aba (`Ctrl+W`), Sair (`Ctrl+Q`)
+- **Editar** — Buscar (`Ctrl+F`), Marcar/Desmarcar Bookmark (`Ctrl+B`), Renomear (`N`), Comentar (`;`)
+- **Visualizar** — Painel Hex Dump, Sincronizar navegação, Estatísticas (`Ctrl+I`), Grafo de fluxo (CFG), Console Python (`F12`)
+- **Ajuda** — Sobre, Atalhos de teclado
+
+#### GUI features
+
+- **Annotations** — rename variables/functions (`N`) and add inline comments (`;`) on bytecode or recovered code; saved alongside the binary as `.annotations.json`
+- **Bookmarks** — mark/jump to bytecode locations (`Ctrl+B`) with a persistent panel
+- **CFG Viewer** — visualize the control flow graph of any function with zoom, pan, and fit-to-view
+- **Bin Diff** (`Ctrl+D`) — side-by-side comparison of two files, highlighting bytecode differences
+- **Statistics** (`Ctrl+I`) — opcode distribution, import list, code-object metrics, and handler analysis
+- **Python Console** (`F12`) — interactive REPL with access to the current session's `bytecode`, `recovered`, and `meta` variables
+- **Synchronized navigation** — keep the bytecode and recovered-code views aligned while scrolling
+- **Format detection** — for `.mpy` files, the status bar shows MicroPython version, target architecture, and counts of bytecode / native / viper functions
+- **Context menus** — copy as Markdown, copy entire function, search references, rename, and comment from a right-click on either code view
 
 ### Command-Line Interface (Pipeline Stages)
 
@@ -79,7 +108,7 @@ Available stages:
 | `blocks` | Basic blocks (leader detection) |
 | `cfg` | Control flow graph (edges and successors) |
 | `stack` | Stack simulation results (expressions and statements per block) |
-| `patterns` | High-level pattern detection (if/loop/try-except) |
+| `patterns` | High-level pattern detection (if/loop/try-except/match) |
 | `recovered_ast` | Recovered AST structure |
 | `gen_code` | Final recovered Python source code |
 
