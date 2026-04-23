@@ -4,7 +4,7 @@ import time
 import json
 import hashlib
 
-from PySide6.QtCore import Qt, QEvent, QSettings
+from PySide6.QtCore import Qt, QEvent, QSettings, QTimer
 from PySide6.QtGui import (
     QAction, QColor, QFont, QFontDatabase, QKeySequence,
     QTextCharFormat, QTextCursor, QTextDocument,
@@ -12,9 +12,9 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QFileDialog, QGroupBox, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
-    QStackedWidget, QTabBar, QTextEdit, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
+    QSplitter, QStackedWidget, QTabBar, QTextEdit, QToolTip, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from UI.ui_config import (
@@ -25,7 +25,9 @@ from UI.ui_parsers import (
     parse_bytecode, split_recovered_functions, parse_mpy_summary,
     parse_all_constants, parse_exception_handlers,
 )
-from UI.annotations import load_annotations, save_annotations, apply_renames
+from UI.annotations import (
+    load_annotations, save_annotations, apply_renames, apply_scoped_renames,
+)
 from UI.stats_dialog import StatsDialog
 from UI.cfg_view import CfgView
 from UI.diff_view import DiffView
@@ -38,7 +40,6 @@ from NativeDisasm.base import format_hex_dump
 
 _MAX_RECENT = 10
 
-# Prefixos por tipo de code object na árvore
 _TYPE_PREFIX = {
     "class":    "\u25C6 ",   # ◆
     "function": "\u0192 ",   # ƒ
@@ -51,7 +52,6 @@ _TYPE_PREFIX = {
 
 
 def _detect_format(path: str) -> str:
-    """Detecta o formato do arquivo pelo conteúdo e extensão."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pyc":
         return "cpython"
@@ -65,12 +65,9 @@ def _detect_format(path: str) -> str:
     raise ValueError(f"Extensão não suportada: {ext}")
 
 
-# ------------------------------------------------------------------
-# Widget de busca textual (Ctrl+F)
-# ------------------------------------------------------------------
 
 class SearchBar(QWidget):
-    """Barra de busca para um QPlainTextEdit."""
+
 
     def __init__(self, target: QPlainTextEdit, parent=None):
         super().__init__(parent)
@@ -223,17 +220,27 @@ class MainWindow(QMainWindow):
         self._strings: list      = []
         self._recovered_funcs: dict = {}
         self._recovered_full: str   = ""
-        self._worker: EngineWorker | None = None
+        self._workers: dict[int, EngineWorker] = {}
+        self._is_busy: bool = False
         self._load_start: float = 0.0
         self._bookmarks: list = []
-        self._annotations: dict = {"renames": {}, "comments_bc": {}, "comments_rc": {}}
+        self._bytecode_full: str = ""
+        self._annotations: dict = {"renames": {}, "renames_local": {}, "comments_bc": {}, "comments_rc": {}}
         self._settings = QSettings("PythonDecompiler", "PythonDecompiler")
+
+        # Edição inline de comentários
+        self._comment_editing: bool = False
+        self._comment_edit_target: QPlainTextEdit | None = None
+        self._comment_edit_line: int = -1
+        self._comment_edit_original: str = ""
+        self._comment_edit_panel: str = ""
 
         # Navegação bidirecional
         self._sync_nav: bool = True
         self._sync_guard: bool = False
         self._bc_line_to_func: dict[int, str] = {}
         self._rc_line_to_func: dict[int, str] = {}
+        self._last_synced_rc_func: str = ""
 
         # Sessões (múltiplas abas)
         self._sessions: dict[int, dict] = {}
@@ -335,11 +342,40 @@ class MainWindow(QMainWindow):
         self._tab_bar.setTabsClosable(True)
         self._tab_bar.setMovable(True)
         self._tab_bar.setExpanding(False)
+        self._tab_bar.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
         self._tab_bar.currentChanged.connect(self._switch_tab)
         self._tab_bar.tabCloseRequested.connect(self._close_tab)
 
+        self._tab_bar_row = QHBoxLayout()
+        self._tab_bar_row.setContentsMargins(0, 0, 0, 0)
+        self._tab_bar_row.setSpacing(0)
+        self._tab_bar_row.addWidget(self._tab_bar, 0)
+        self._tab_bar_row.addStretch(1)
+
         # ---- Splitter horizontal (3 painéis) ----
+        _splitter_css = """
+            QSplitter::handle {
+                background-color: palette(mid);
+                border-radius: 1px;
+            }
+            QSplitter::handle:horizontal {
+                min-width: 5px;
+                margin: 0 -3px;   /* expande zona de clique sem ocupar espaço */
+            }
+            QSplitter::handle:vertical {
+                min-height: 5px;
+                margin: -3px 0;
+            }
+            QSplitter::handle:hover {
+                background-color: palette(highlight);
+            }
+        """
         h_splitter = QSplitter(Qt.Orientation.Horizontal)
+        h_splitter.setHandleWidth(5)
+        h_splitter.setStyleSheet(_splitter_css)
+        h_splitter.setChildrenCollapsible(False)
 
         # Painel esquerdo — listas (layout original)
         left = QWidget()
@@ -373,7 +409,11 @@ class MainWindow(QMainWindow):
         self._tree_consts.currentItemChanged.connect(self._on_const_select)
         self._list_addrs.currentItemChanged.connect(self._on_addr_select)
         self._list_bookmarks.itemClicked.connect(self._on_bookmark_click)
+        self._list_bookmarks.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list_bookmarks.customContextMenuRequested.connect(self._bookmarks_context_menu)
         self._list_comments.itemClicked.connect(self._on_comment_click)
+        self._list_comments.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list_comments.customContextMenuRequested.connect(self._comments_context_menu)
 
         # Painel central — Bytecode (com SearchBar)
         mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
@@ -436,6 +476,9 @@ class MainWindow(QMainWindow):
         self._console_group = console_group
 
         bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+        bottom_splitter.setHandleWidth(5)
+        bottom_splitter.setStyleSheet(_splitter_css)
+        bottom_splitter.setChildrenCollapsible(False)
         bottom_splitter.addWidget(self._hex_group)
         bottom_splitter.addWidget(comments_group)
         bottom_splitter.addWidget(console_group)
@@ -446,6 +489,9 @@ class MainWindow(QMainWindow):
 
         # ---- Splitter vertical ----
         v_splitter = QSplitter(Qt.Orientation.Vertical)
+        v_splitter.setHandleWidth(5)
+        v_splitter.setStyleSheet(_splitter_css)
+        v_splitter.setChildrenCollapsible(False)
         v_splitter.addWidget(h_splitter)
         v_splitter.addWidget(bottom_splitter)
         v_splitter.setSizes([600, 200])
@@ -453,7 +499,7 @@ class MainWindow(QMainWindow):
         v_splitter.setStretchFactor(1, 0)
 
         root.addWidget(topbar)
-        root.addWidget(self._tab_bar)
+        root.addLayout(self._tab_bar_row)
         root.addWidget(v_splitter)
         return page
 
@@ -489,7 +535,7 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        act = file_menu.addAction("&Comparar...")
+        act = file_menu.addAction("Bin &Diff...")
         act.setShortcut(QKeySequence("Ctrl+D"))
         act.triggered.connect(self._compare_files)
 
@@ -512,7 +558,7 @@ class MainWindow(QMainWindow):
         act.setShortcut(QKeySequence("Ctrl+F"))
         act.triggered.connect(self._toggle_search)
 
-        act = edit_menu.addAction("Alternar &Bookmark")
+        act = edit_menu.addAction("Marcar/Desmarcar &Bookmark")
         act.setShortcut(QKeySequence("Ctrl+B"))
         act.triggered.connect(self._toggle_bookmark)
 
@@ -521,8 +567,8 @@ class MainWindow(QMainWindow):
         act = edit_menu.addAction("Re&nomear... (N)")
         act.triggered.connect(self._rename_at_cursor)
 
-        act = edit_menu.addAction("&Comentar... (;)")
-        act.triggered.connect(self._add_comment)
+        act = edit_menu.addAction("&Comentar (;)")
+        act.triggered.connect(self._start_inline_comment)
 
         # --- Visualizar ---
         view_menu = menubar.addMenu("&Visualizar")
@@ -580,8 +626,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "Sobre",
             f"<h3>{APP_TITLE}</h3>"
-            "<p>Decompilador de bytecode Python 3.12 e MicroPython (.mpy v6).</p>"
-            "<p>Suporta arquivos .pyc (CPython 3.12) e .mpy (MicroPython v6).</p>",
+            "<p>Decompilador de bytecode para CPython 3.12 (.pyc) e MicroPython v6 (.mpy).</p>",
         )
 
     def _show_shortcuts(self):
@@ -592,12 +637,12 @@ class MainWindow(QMainWindow):
             "<tr><td><b>Ctrl+R</b></td><td>&nbsp;&nbsp;Recarregar</td></tr>"
             "<tr><td><b>Ctrl+S</b></td><td>&nbsp;&nbsp;Salvar código recuperado</td></tr>"
             "<tr><td><b>Ctrl+F</b></td><td>&nbsp;&nbsp;Buscar no painel</td></tr>"
-            "<tr><td><b>Ctrl+B</b></td><td>&nbsp;&nbsp;Alternar bookmark</td></tr>"
+            "<tr><td><b>Ctrl+B</b></td><td>&nbsp;&nbsp;Marcar/desmarcar bookmark</td></tr>"
             "<tr><td><b>Ctrl+I</b></td><td>&nbsp;&nbsp;Estatísticas</td></tr>"
-            "<tr><td><b>N</b></td><td>&nbsp;&nbsp;Renomear (no painel de código)</td></tr>"
+            "<tr><td><b>N</b></td><td>&nbsp;&nbsp;Renomear (local/global)</td></tr>"
             "<tr><td><b>;</b></td><td>&nbsp;&nbsp;Adicionar comentário</td></tr>"
             "<tr><td><b>Ctrl+W</b></td><td>&nbsp;&nbsp;Fechar aba</td></tr>"
-            "<tr><td><b>Ctrl+D</b></td><td>&nbsp;&nbsp;Comparar arquivos</td></tr>"
+            "<tr><td><b>Ctrl+D</b></td><td>&nbsp;&nbsp;Bin Diff</td></tr>"
             "<tr><td><b>F12</b></td><td>&nbsp;&nbsp;Console Python</td></tr>"
             "<tr><td><b>Ctrl+Q</b></td><td>&nbsp;&nbsp;Sair</td></tr>"
             "<tr><td><b>Enter</b></td><td>&nbsp;&nbsp;Próximo resultado</td></tr>"
@@ -722,11 +767,9 @@ class MainWindow(QMainWindow):
             return
 
         runner = run_engine if fmt == "cpython" else run_mpy_engine
-        if self._worker and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait()
 
-        # Salva sessão atual antes de trocar
+        # Salva sessão atual antes de trocar — workers antigos continuam rodando
+        # em paralelo e entregam o resultado via sid no _on_engine_result.
         if self._active_sid >= 0:
             self._save_session(self._active_sid)
 
@@ -751,27 +794,67 @@ class MainWindow(QMainWindow):
             raw_bytes = f.read()
         self._hex_text.setPlainText(format_hex_dump(raw_bytes))
 
-        self._worker = EngineWorker(path, runner=runner)
-        self._worker.result.connect(self._on_engine_result)
-        self._worker.error.connect(self._on_engine_error)
-        self._worker.start()
+        worker = EngineWorker(path, sid=sid, runner=runner)
+        worker.result.connect(self._on_engine_result)
+        worker.error.connect(self._on_engine_error)
+        worker.finished.connect(lambda s=sid: self._workers.pop(s, None))
+        self._workers[sid] = worker
+        worker.start()
         self._add_to_recent(path)
 
     def _set_busy(self, busy: bool):
-        if busy:
+        # Idempotente — evita empilhar override cursors quando há múltiplos
+        # workers ativos (cada aba tem o seu) e só o da aba ativa controla
+        # este estado.
+        if busy and not self._is_busy:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        else:
+            self._is_busy = True
+        elif not busy and self._is_busy:
             QApplication.restoreOverrideCursor()
+            self._is_busy = False
         for btn in (self._btn_open, self._btn_reload, self._btn_close_tab, self._btn_splash_open):
             btn.setEnabled(not busy)
 
-    def _on_engine_result(self, byte_txt: str, rec_txt: str, meta: dict):
-        self._set_busy(False)
+    def _on_engine_result(self, sid: int, byte_txt: str, rec_txt: str, meta: dict):
+        # Só libera o estado "busy" se o resultado é da aba ativa — caso
+        # contrário a aba ativa ainda está carregando e não queremos habilitar
+        # os botões prematuramente.
+        if sid == self._active_sid:
+            self._set_busy(False)
+
+        # Se o resultado é para uma aba que não é mais a ativa (race condition),
+        # salva direto no dict da sessão e não mexe nos widgets.
+        if sid != self._active_sid:
+            s = self._sessions.get(sid)
+            if s is not None:
+                s["bytecode_meta"] = meta
+                s["bytecode_full"] = byte_txt
+                s["recovered_full"] = rec_txt
+                s["func_meta"], s["addr_items"], s["strings"] = parse_bytecode(byte_txt)
+                s["recovered_funcs"] = split_recovered_functions(rec_txt)
+                s["byte_txt"] = byte_txt
+                s["rec_txt"] = rec_txt
+                # Carrega annotations do arquivo (não zerar — o usuário pode ter dados)
+                path = s.get("path", "")
+                s["annotations"] = load_annotations(path) if path else {
+                    "renames": {}, "renames_local": {}, "comments_bc": {}, "comments_rc": {}}
+                s["bookmarks"] = []
+                s["bc_line_to_func"] = {}
+                s["rc_line_to_func"] = {}
+                s["handlers"] = []
+                s["load_start"] = s.get("load_start", 0.0)
+                mpy = meta.get("__mpy__")
+                if mpy:
+                    s["format_info"] = parse_mpy_summary(byte_txt, meta)
+                    s["format_visible"] = True
+                else:
+                    s["format_info"] = ""
+                    s["format_visible"] = False
+            return
+
         self.bytecode_meta = meta
 
-        self._byte_text.setPlainText(byte_txt)
-        self._rec_text.setPlainText(rec_txt)
-
+        self._bytecode_full = byte_txt
         self._func_meta, self._addr_items, self._strings = parse_bytecode(byte_txt)
         self._recovered_funcs = split_recovered_functions(rec_txt)
         self._recovered_full  = rec_txt
@@ -787,7 +870,14 @@ class MainWindow(QMainWindow):
         self._update_statusbar()
         self._load_bookmarks()
         self._load_annotations()
+
+        # Seta o texto com renomeações e comentários inline
+        self._byte_text.setPlainText(
+            self._prepare_display_text(byte_txt, "comments_bc"))
+        self._rec_text.setPlainText(
+            self._prepare_display_text(rec_txt, "comments_rc"))
         self._render_comment_highlights()
+        self._refresh_comments_list()
 
         # Atualiza namespace do console
         self._console.set_namespace({
@@ -795,13 +885,16 @@ class MainWindow(QMainWindow):
             "recovered": rec_txt, "meta": meta,
         })
 
-    def _on_engine_error(self, msg: str):
-        self._set_busy(False)
-        # Remove a aba que falhou
-        if self._active_sid >= 0:
+    def _on_engine_error(self, sid: int, msg: str):
+        if sid == self._active_sid:
+            self._set_busy(False)
+
+        # Identifica a aba que falhou pelo sid (pode não ser a ativa)
+        target_sid = sid if sid >= 0 else self._active_sid
+        if target_sid >= 0:
             for i in range(self._tab_bar.count()):
-                if self._tab_bar.tabData(i) == self._active_sid:
-                    self._sessions.pop(self._active_sid, None)
+                if self._tab_bar.tabData(i) == target_sid:
+                    self._sessions.pop(target_sid, None)
                     self._tab_bar.blockSignals(True)
                     self._tab_bar.removeTab(i)
                     self._tab_bar.blockSignals(False)
@@ -916,18 +1009,27 @@ class MainWindow(QMainWindow):
             return
         name = current.data(0, Qt.ItemDataRole.UserRole)
         if not name or name == "__view_all__":
-            self._rec_text.setPlainText(self._recovered_full)
+            self._sync_guard = True
+            self._rec_text.setPlainText(
+                self._prepare_display_text(self._recovered_full, "comments_rc"))
+            self._sync_guard = False
+            self._render_comment_highlights()
             return
 
         code = self._recovered_funcs.get(name, "")
         if code:
             self._sync_guard = True
-            self._rec_text.setPlainText(code)
+            self._rec_text.setPlainText(
+                self._prepare_display_text(code, "comments_rc", func_name=name))
             self._sync_guard = False
         else:
             # Code object sem código recuperado individual (lambda, genexpr...)
             # Mostra tudo e tenta navegar ao bytecode
-            self._rec_text.setPlainText(self._recovered_full)
+            self._sync_guard = True
+            self._rec_text.setPlainText(
+                self._prepare_display_text(self._recovered_full, "comments_rc"))
+            self._sync_guard = False
+            self._render_comment_highlights()
 
         meta = self._func_meta.get(name)
         if meta and meta.get("addr"):
@@ -952,6 +1054,7 @@ class MainWindow(QMainWindow):
 
     def _build_line_maps(self):
         """Constrói mapeamento linha→função para ambos os painéis."""
+        self._last_synced_rc_func = ""
         # Bytecode: cada code object vai do seu header até o próximo
         self._bc_line_to_func = {}
         entries = []
@@ -961,7 +1064,7 @@ class MainWindow(QMainWindow):
             if line is not None:
                 entries.append((line - 1, name))  # 0-based
         entries.sort()
-        total_bc = self._byte_text.document().blockCount()
+        total_bc = self._bytecode_full.count("\n") + 1
         for i, (start, name) in enumerate(entries):
             end = entries[i + 1][0] if i + 1 < len(entries) else total_bc
             for ln in range(start, end):
@@ -969,13 +1072,18 @@ class MainWindow(QMainWindow):
 
         # Recovered: cada função vai do início da sua def até a próxima
         self._rc_line_to_func = {}
+        rc_entries = []
         for name, text in self._recovered_funcs.items():
             pos = self._recovered_full.find(text)
             if pos < 0:
                 continue
             start_line = self._recovered_full[:pos].count("\n")
-            n_lines = text.count("\n") + 1
-            for ln in range(start_line, start_line + n_lines):
+            rc_entries.append((start_line, name))
+        rc_entries.sort()
+        total_rc = self._recovered_full.count("\n") + 1
+        for i, (start, name) in enumerate(rc_entries):
+            end = rc_entries[i + 1][0] if i + 1 < len(rc_entries) else total_rc
+            for ln in range(start, end):
                 self._rc_line_to_func[ln] = name
 
     def _on_byte_cursor_moved(self):
@@ -983,10 +1091,16 @@ class MainWindow(QMainWindow):
         if self._sync_guard or not self._sync_nav:
             return
         line = self._byte_text.textCursor().blockNumber()
+        self._show_comment_for_line("comments_bc", line)
+        # Limpa highlights de função antigos no bytecode (de sync rec→bc anterior)
+        self._byte_text.setExtraSelections(
+            self._comment_selections_for("comments_bc", self._byte_text))
         name = self._bc_line_to_func.get(line)
         if not name:
+            self._last_synced_rc_func = ""
+            self._rec_text.setExtraSelections(
+                self._comment_selections_for("comments_rc", self._rec_text))
             return
-        # Destaca a faixa da função no painel de código recuperado
         self._highlight_func_in_recovered(name)
 
     def _on_rec_cursor_moved(self):
@@ -994,25 +1108,40 @@ class MainWindow(QMainWindow):
         if self._sync_guard or not self._sync_nav:
             return
         line = self._rec_text.textCursor().blockNumber()
-        # Calcula a linha absoluta no texto completo quando View All está ativo
+        self._show_comment_for_line("comments_rc", line)
+        # Limpa highlights de função antigos no recovered (de sync bc→rec anterior)
+        self._rec_text.setExtraSelections(
+            self._comment_selections_for("comments_rc", self._rec_text))
+        self._last_synced_rc_func = ""
         name = self._rc_line_to_func.get(line)
         if not name:
+            self._byte_text.setExtraSelections(
+                self._comment_selections_for("comments_bc", self._byte_text))
             return
-        # Destaca a faixa do code object no bytecode
         self._highlight_func_in_bytecode(name)
 
+    def _show_comment_for_line(self, panel: str, line: int):
+        """Exibe o comentário da linha na statusbar, se houver."""
+        key = str(line + 1)
+        comment = self._annotations.get(panel, {}).get(key)
+        if comment:
+            self.statusBar().showMessage(f"# {comment}", 5000)
+
     def _highlight_func_in_recovered(self, name: str):
-        """Aplica highlight sutil na faixa da função no painel de código."""
+        """Destaca e navega até a função correspondente no painel de código."""
         text = self._recovered_funcs.get(name)
         if not text:
             return
         pos = self._recovered_full.find(text)
         if pos < 0:
             return
-        # Só funciona no modo "View All"
+
+        # Se não está em "View All", muda para "View All" para mostrar todas as funções
         current = self._tree_funcs.currentItem()
-        if current and current.data(0, Qt.ItemDataRole.UserRole) != "__view_all__":
-            return
+        if not current or current.data(0, Qt.ItemDataRole.UserRole) != "__view_all__":
+            self._sync_guard = True
+            self._tree_funcs.setCurrentItem(self._view_all_item)
+            self._sync_guard = False
 
         start_line = self._recovered_full[:pos].count("\n")
         n_lines = text.count("\n") + 1
@@ -1020,7 +1149,7 @@ class MainWindow(QMainWindow):
         fmt = QTextCharFormat()
         fmt.setBackground(QColor(hl_color))
 
-        selections = []
+        selections = self._comment_selections_for("comments_rc", self._rec_text)
         doc = self._rec_text.document()
         for ln in range(start_line, start_line + n_lines):
             block = doc.findBlockByNumber(ln)
@@ -1034,6 +1163,43 @@ class MainWindow(QMainWindow):
             sel.cursor = cursor
             selections.append(sel)
         self._rec_text.setExtraSelections(selections)
+
+        if name != self._last_synced_rc_func:
+            self._last_synced_rc_func = name
+            block = doc.findBlockByNumber(start_line)
+            if block.isValid():
+                nav_cursor = QTextCursor(block)
+                self._sync_guard = True
+                self._rec_text.setTextCursor(nav_cursor)
+                self._rec_text.ensureCursorVisible()
+                self._sync_guard = False
+
+    def _comment_selections_for(self, panel: str, text_edit) -> list:
+        """Retorna ExtraSelections de highlight verde para linhas com comentários."""
+        comments = self._annotations.get(panel, {})
+        if not comments:
+            return []
+        hl_color = "#1a3a2a" if _is_dark() else "#d0f0d0"
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(hl_color))
+        sels = []
+        doc = text_edit.document()
+        for key in comments:
+            try:
+                line = int(key) - 1
+            except ValueError:
+                continue
+            block = doc.findBlockByNumber(line)
+            if not block.isValid():
+                continue
+            cursor = QTextCursor(block)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                                QTextCursor.MoveMode.KeepAnchor)
+            sel = QTextEdit.ExtraSelection()
+            sel.format = fmt
+            sel.cursor = cursor
+            sels.append(sel)
+        return sels
 
     def _highlight_func_in_bytecode(self, name: str):
         """Aplica highlight sutil na faixa do code object no bytecode."""
@@ -1057,7 +1223,7 @@ class MainWindow(QMainWindow):
         fmt = QTextCharFormat()
         fmt.setBackground(QColor(hl_color))
 
-        selections = []
+        selections = self._comment_selections_for("comments_bc", self._byte_text)
         doc = self._byte_text.document()
         for ln in range(start, end):
             block = doc.findBlockByNumber(ln)
@@ -1180,10 +1346,22 @@ class MainWindow(QMainWindow):
             return
 
         line = text_edit.textCursor().blockNumber()
-        block_text = text_edit.document().findBlockByNumber(line).text()[:60].strip()
+        block = text_edit.document().findBlockByNumber(line)
+        block_text = block.text() if block.isValid() else ""
+        display_text = block_text[:60].strip() or "(linha vazia)"
+
+        # Para o painel de código recuperado, guarda também o nome do code
+        # object ativo na árvore — o número de linha é relativo à visão atual,
+        # então precisamos restaurar a mesma visão ao clicar no bookmark.
+        func_ctx: str | None = None
+        if panel == "recovered":
+            current = self._tree_funcs.currentItem()
+            if current is not None:
+                func_ctx = current.data(0, Qt.ItemDataRole.UserRole)
 
         for i, bm in enumerate(self._bookmarks):
-            if bm["panel"] == panel and bm["line"] == line:
+            if (bm["panel"] == panel and bm["line"] == line
+                    and bm.get("func") == func_ctx):
                 self._bookmarks.pop(i)
                 self._refresh_bookmarks()
                 self._save_bookmarks()
@@ -1193,11 +1371,31 @@ class MainWindow(QMainWindow):
         prefix = "BC" if panel == "bytecode" else "RC"
         self._bookmarks.append({
             "panel": panel, "line": line,
-            "label": f"[{prefix}] L{line + 1}: {block_text}",
+            "func": func_ctx,
+            "block_text": block_text,
+            "label": f"[{prefix}] L{line + 1}: {display_text}",
         })
         self._refresh_bookmarks()
         self._save_bookmarks()
         self.statusBar().showMessage("Bookmark adicionado.", 2000)
+
+    def _find_tree_item_by_name(self, name: str) -> QTreeWidgetItem | None:
+        """Procura um item da árvore de code objects pelo nome (UserRole)."""
+        def _walk(node: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            if node.data(0, Qt.ItemDataRole.UserRole) == name:
+                return node
+            for i in range(node.childCount()):
+                found = _walk(node.child(i))
+                if found is not None:
+                    return found
+            return None
+
+        root = self._tree_funcs.invisibleRootItem()
+        for i in range(root.childCount()):
+            found = _walk(root.child(i))
+            if found is not None:
+                return found
+        return None
 
     def _on_bookmark_click(self, item: QListWidgetItem):
         idx = self._list_bookmarks.row(item)
@@ -1206,28 +1404,64 @@ class MainWindow(QMainWindow):
         bm = self._bookmarks[idx]
 
         if bm["panel"] == "recovered":
-            self._tree_funcs.setCurrentItem(self._view_all_item)
+            # Restaura a mesma visão (View All ou função específica) em que o
+            # bookmark foi criado — o número de linha é relativo a essa visão.
+            target_name = bm.get("func") or "__view_all__"
+            if target_name == "__view_all__":
+                target_item = self._view_all_item
+            else:
+                target_item = self._find_tree_item_by_name(target_name) or self._view_all_item
+            if self._tree_funcs.currentItem() is not target_item:
+                self._tree_funcs.setCurrentItem(target_item)
             target = self._rec_text
         else:
             target = self._byte_text
 
+        expected_text = bm.get("block_text")
         block = target.document().findBlockByNumber(bm["line"])
-        if block.isValid():
-            cursor = QTextCursor(block)
-            cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
-            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
-                                QTextCursor.MoveMode.KeepAnchor)
-            target.setTextCursor(cursor)
-            target.setFocus()
-            target.centerCursor()
+        # Fallback: se a linha não bate mais (texto mudou / shift), procura pelo conteúdo.
+        if (not block.isValid()
+                or (expected_text is not None and block.text() != expected_text)):
+            if expected_text:
+                found_cursor = target.document().find(expected_text)
+                if not found_cursor.isNull():
+                    block = found_cursor.block()
 
-            hl_color = "#7a6300" if _is_dark() else "#ffe080"
-            fmt = QTextCharFormat()
-            fmt.setBackground(QColor(hl_color))
-            sel = QTextEdit.ExtraSelection()
-            sel.format = fmt
-            sel.cursor = cursor
-            target.setExtraSelections([sel])
+        if not block.isValid():
+            self.statusBar().showMessage(
+                "Bookmark inválido — linha não encontrada.", 3000)
+            return
+
+        # Cursor de navegação (sem seleção — senão o Qt pinta a seleção
+        # padrão cinza por cima do ExtraSelection).
+        nav_cursor = QTextCursor(block)
+        nav_cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+
+        # Cursor de highlight (seleciona a linha inteira para o ExtraSelection).
+        hl_cursor = QTextCursor(block)
+        hl_cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        hl_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                               QTextCursor.MoveMode.KeepAnchor)
+
+        # Bloqueia o handler de cursorPositionChanged: sem isso, o
+        # _on_*_cursor_moved chamaria _highlight_func_in_* logo em seguida
+        # e sobrescreveria o highlight do bookmark com o destaque de função.
+        self._sync_guard = True
+        try:
+            target.setTextCursor(nav_cursor)
+            target.setFocus()
+            target.ensureCursorVisible()
+            target.centerCursor()
+        finally:
+            self._sync_guard = False
+
+        hl_color = "#e65100" if _is_dark() else "#ffe0b2"
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(hl_color))
+        sel = QTextEdit.ExtraSelection()
+        sel.format = fmt
+        sel.cursor = hl_cursor
+        target.setExtraSelections([sel])
 
     def _refresh_bookmarks(self):
         self._list_bookmarks.clear()
@@ -1250,6 +1484,103 @@ class MainWindow(QMainWindow):
                 self._bookmarks = []
         self._refresh_bookmarks()
 
+    def _bookmarks_context_menu(self, pos):
+        item = self._list_bookmarks.itemAt(pos)
+        menu = QMenu(self)
+        if item is not None:
+            act_del = menu.addAction("Excluir bookmark")
+            act_del.triggered.connect(lambda: self._delete_bookmark(self._list_bookmarks.row(item)))
+        if self._bookmarks:
+            act_all = menu.addAction("Excluir todos os bookmarks")
+            act_all.triggered.connect(self._delete_all_bookmarks)
+        if menu.isEmpty():
+            return
+        menu.exec(self._list_bookmarks.mapToGlobal(pos))
+
+    def _delete_bookmark(self, idx: int):
+        if 0 <= idx < len(self._bookmarks):
+            self._bookmarks.pop(idx)
+            self._refresh_bookmarks()
+            self._save_bookmarks()
+            self.statusBar().showMessage("Bookmark removido.", 2000)
+
+    def _delete_all_bookmarks(self):
+        if QMessageBox.question(
+            self, "Confirmar",
+            "Excluir todos os bookmarks?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self._bookmarks.clear()
+            self._refresh_bookmarks()
+            self._save_bookmarks()
+            self.statusBar().showMessage("Todos os bookmarks removidos.", 2000)
+
+    def _comments_context_menu(self, pos):
+        item = self._list_comments.itemAt(pos)
+        menu = QMenu(self)
+        if item is not None:
+            act_del = menu.addAction("Excluir comentário")
+            act_del.triggered.connect(lambda: self._delete_comment(item))
+        has_comments = (self._annotations.get("comments_bc")
+                        or self._annotations.get("comments_rc"))
+        if has_comments:
+            act_all = menu.addAction("Excluir todos os comentários")
+            act_all.triggered.connect(self._delete_all_comments)
+        if menu.isEmpty():
+            return
+        menu.exec(self._list_comments.mapToGlobal(pos))
+
+    def _delete_comment(self, item: QListWidgetItem):
+        text = item.text()
+        if text.startswith("[BC]"):
+            panel = "comments_bc"
+        elif text.startswith("[RC]"):
+            panel = "comments_rc"
+        else:
+            return
+        m = re.search(r"L(\d+):", text)
+        if not m:
+            return
+        key = m.group(1)
+        self._annotations.get(panel, {}).pop(key, None)
+        self._save_current_annotations()
+        self._render_comment_highlights()
+        self._refresh_comments_list()
+        self._refresh_comment_display()
+        self.statusBar().showMessage("Comentário removido.", 2000)
+
+    def _delete_all_comments(self):
+        if QMessageBox.question(
+            self, "Confirmar",
+            "Excluir todos os comentários?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self._annotations["comments_bc"] = {}
+            self._annotations["comments_rc"] = {}
+            self._save_current_annotations()
+            self._render_comment_highlights()
+            self._refresh_comments_list()
+            self._refresh_comment_display()
+            self.statusBar().showMessage("Todos os comentários removidos.", 2000)
+
+    def _refresh_comment_display(self):
+        """Recarrega o texto exibido nos painéis, removendo comentários inline excluídos."""
+        if self._bytecode_full:
+            self._byte_text.setPlainText(
+                self._prepare_display_text(self._bytecode_full, "comments_bc"))
+        current = self._tree_funcs.currentItem()
+        if current is not None:
+            name = current.data(0, Qt.ItemDataRole.UserRole)
+            if name and name != "__view_all__":
+                code = self._recovered_funcs.get(name, "")
+                if code:
+                    self._rec_text.setPlainText(
+                        self._prepare_display_text(code, "comments_rc", func_name=name))
+                    return
+        if self._recovered_full:
+            self._rec_text.setPlainText(
+                self._prepare_display_text(self._recovered_full, "comments_rc"))
+
     # ------------------------------------------------------------------
     # Menus de contexto (Copy as...)
     # ------------------------------------------------------------------
@@ -1268,8 +1599,10 @@ class MainWindow(QMainWindow):
             act = menu.addAction(f"Buscar referências de '{word}'")
             act.triggered.connect(lambda: self._show_xrefs(word))
 
+        act = menu.addAction("Renomear...")
+        act.triggered.connect(self._rename_at_cursor)
         act = menu.addAction("Comentar...")
-        act.triggered.connect(self._add_comment)
+        act.triggered.connect(self._start_inline_comment)
 
         menu.exec(self._byte_text.mapToGlobal(pos))
 
@@ -1292,7 +1625,7 @@ class MainWindow(QMainWindow):
         act = menu.addAction("Renomear...")
         act.triggered.connect(self._rename_at_cursor)
         act = menu.addAction("Comentar...")
-        act.triggered.connect(self._add_comment)
+        act.triggered.connect(self._start_inline_comment)
 
         menu.exec(self._rec_text.mapToGlobal(pos))
 
@@ -1349,13 +1682,62 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.KeyPress and obj in (self._byte_text, self._rec_text):
-            if event.key() == Qt.Key.Key_N and not event.modifiers():
-                self._rename_at_cursor()
-                return True
-            if event.key() == Qt.Key.Key_Semicolon and not event.modifiers():
-                self._add_comment()
-                return True
+        if event.type() == QEvent.Type.KeyPress:
+            # --- modo de edição inline de comentário ---
+            if self._comment_editing and obj is self._comment_edit_target:
+                key = event.key()
+                # Enter salva, Escape cancela
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    self._finish_inline_comment(save=True)
+                    return True
+                if key == Qt.Key.Key_Escape:
+                    self._finish_inline_comment(save=False)
+                    return True
+                # Setas verticais: salva e sai
+                if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                    self._finish_inline_comment(save=True)
+                    return True
+                # Backspace: não permitir apagar antes do marcador "  # "
+                if key == Qt.Key.Key_Backspace:
+                    cursor = obj.textCursor()
+                    min_col = len(self._comment_edit_original) + 4  # "  # "
+                    if cursor.positionInBlock() <= min_col:
+                        return True
+                # Bloquear edição de outras linhas
+                cursor = obj.textCursor()
+                if cursor.blockNumber() != self._comment_edit_line:
+                    self._finish_inline_comment(save=True)
+                    return True
+                return False  # Permite digitação normal
+
+            # --- modo normal ---
+            if obj in (self._byte_text, self._rec_text):
+                if event.key() == Qt.Key.Key_N and not event.modifiers():
+                    self._rename_at_cursor()
+                    return True
+                if event.key() == Qt.Key.Key_Semicolon and not event.modifiers():
+                    self._start_inline_comment()
+                    return True
+
+        # Perda de foco encerra edição inline
+        if (self._comment_editing and event.type() == QEvent.Type.FocusOut
+                and obj is self._comment_edit_target):
+            self._finish_inline_comment(save=True)
+
+        # Tooltip ao passar o mouse sobre linhas comentadas
+        if event.type() == QEvent.Type.ToolTip and obj in (self._byte_text, self._rec_text):
+            panel = "comments_bc" if obj is self._byte_text else "comments_rc"
+            pos = event.pos()
+            cursor = obj.cursorForPosition(pos)
+            line = cursor.blockNumber()
+            key = str(line + 1)
+            comment = self._annotations.get(panel, {}).get(key)
+            if comment:
+                QToolTip.showText(event.globalPos(), f"# {comment}", obj)
+            else:
+                QToolTip.hideText()
+            return True
+
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------
@@ -1363,14 +1745,19 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _rename_at_cursor(self):
-        """Renomeia o identificador sob o cursor no código recuperado."""
+        """Renomeia o identificador sob o cursor (com escopo local/global)."""
         focus = QApplication.focusWidget()
         if focus is self._rec_text:
             text_edit = self._rec_text
+            line = text_edit.textCursor().blockNumber()
+            func_ctx = self._rc_line_to_func.get(line)
         elif focus is self._byte_text:
             text_edit = self._byte_text
+            line = text_edit.textCursor().blockNumber()
+            func_ctx = self._bc_line_to_func.get(line)
         else:
             text_edit = self._rec_text
+            func_ctx = None
 
         cursor = text_edit.textCursor()
         cursor.select(QTextCursor.SelectionType.WordUnderCursor)
@@ -1380,120 +1767,247 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Posicione o cursor sobre um identificador.", 3000)
             return
 
-        new_name, ok = QInputDialog.getText(
-            self, "Renomear", f"Renomear '{old_name}' para:", text=old_name,
-        )
-        if not ok or not new_name.strip() or new_name.strip() == old_name:
+        # Diálogo com escopo
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Renomear")
+        lay = QVBoxLayout(dlg)
+
+        lay.addWidget(QLabel(f"Renomear '<b>{old_name}</b>' para:"))
+        name_input = QLineEdit(old_name)
+        name_input.selectAll()
+        lay.addWidget(name_input)
+
+        chk_local = None
+        if func_ctx:
+            chk_local = QCheckBox(f"Apenas nesta função ({func_ctx})")
+            chk_local.setChecked(True)
+            lay.addWidget(chk_local)
+
+        btn_lay = QHBoxLayout()
+        btn_lay.addStretch()
+        btn_ok = QPushButton("OK")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_lay.addWidget(btn_ok)
+        btn_lay.addWidget(btn_cancel)
+        lay.addLayout(btn_lay)
+
+        name_input.setFocus()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        new_name = new_name.strip()
-        self._annotations["renames"][old_name] = new_name
+        new_name = name_input.text().strip()
+        if not new_name or new_name == old_name:
+            return
+
+        is_local = chk_local.isChecked() if chk_local else False
+
+        if is_local:
+            bucket = self._annotations.setdefault("renames_local", {})
+            bucket.setdefault(func_ctx, {})[old_name] = new_name
+            scope_label = f"(local: {func_ctx})"
+        else:
+            self._annotations["renames"][old_name] = new_name
+            scope_label = "(global)"
+
         self._save_current_annotations()
         self._apply_renames_to_display()
-        self.statusBar().showMessage(f"Renomeado: {old_name} \u2192 {new_name}", 3000)
+        self.statusBar().showMessage(
+            f"Renomeado: {old_name} \u2192 {new_name} {scope_label}", 3000)
+
+    def _prepare_display_text(self, raw_text: str, panel: str,
+                              func_name: str | None = None) -> str:
+        """Aplica renomeações (global + local) e injeta comentários inline."""
+        gl = self._annotations.get("renames", {})
+        lc = self._annotations.get("renames_local", {})
+        if gl or lc:
+            line_map = (self._bc_line_to_func if panel == "comments_bc"
+                        else self._rc_line_to_func)
+            text = apply_scoped_renames(
+                raw_text, gl, lc,
+                line_to_func=line_map if not func_name else None,
+                func_name=func_name,
+            )
+        else:
+            text = raw_text
+        return self._text_with_comments(text, panel)
 
     def _apply_renames_to_display(self):
-        """Aplica todas as renomeações ao texto recuperado exibido."""
-        renames = self._annotations.get("renames", {})
-        if not renames:
+        """Aplica todas as renomeações aos textos exibidos (bytecode + recovered)."""
+        gl = self._annotations.get("renames", {})
+        lc = self._annotations.get("renames_local", {})
+        if not gl and not lc:
             return
 
-        # Aplica ao texto completo
-        displayed = apply_renames(self._recovered_full, renames)
-
-        # Verifica se está em View All ou função específica
+        # Recovered: usa a função atual ou o texto completo
         current = self._tree_funcs.currentItem()
+        func_name = None
         if current and current.data(0, Qt.ItemDataRole.UserRole) != "__view_all__":
-            name = current.data(0, Qt.ItemDataRole.UserRole)
-            func_code = self._recovered_funcs.get(name, "")
-            if func_code:
-                displayed = apply_renames(func_code, renames)
+            func_name = current.data(0, Qt.ItemDataRole.UserRole)
+        raw_rc = (self._recovered_funcs.get(func_name, self._recovered_full)
+                  if func_name else self._recovered_full)
 
         self._sync_guard = True
-        self._rec_text.setPlainText(displayed)
+        self._rec_text.setPlainText(
+            self._prepare_display_text(raw_rc, "comments_rc", func_name=func_name))
         self._sync_guard = False
+
+        # Bytecode
+        self._byte_text.setPlainText(
+            self._prepare_display_text(self._bytecode_full, "comments_bc"))
+
+        self._render_comment_highlights()
 
     # ------------------------------------------------------------------
     # Comentários (#11)
     # ------------------------------------------------------------------
 
-    def _add_comment(self):
-        """Adiciona ou edita um comentário na linha atual."""
+    def _text_with_comments(self, text: str, panel: str) -> str:
+        """Retorna o texto com comentários inline injetados nas linhas."""
+        comments = self._annotations.get(panel, {})
+        if not comments:
+            return text
+        lines = text.splitlines()
+        for key, comment_text in comments.items():
+            try:
+                idx = int(key) - 1
+            except ValueError:
+                continue
+            if 0 <= idx < len(lines):
+                lines[idx] += f"  # {comment_text}"
+        return "\n".join(lines)
+
+    def _strip_inline_comments(self, text: str, panel: str) -> str:
+        """Remove comentários inline do texto, retornando o texto limpo."""
+        comments = self._annotations.get(panel, {})
+        if not comments:
+            return text
+        lines = text.splitlines()
+        for key, comment_text in comments.items():
+            try:
+                idx = int(key) - 1
+            except ValueError:
+                continue
+            suffix = f"  # {comment_text}"
+            if 0 <= idx < len(lines) and lines[idx].endswith(suffix):
+                lines[idx] = lines[idx][:-len(suffix)]
+        return "\n".join(lines)
+
+    def _start_inline_comment(self):
+        """Inicia edição inline de comentário na linha atual."""
         focus = QApplication.focusWidget()
         if focus is self._rec_text:
             panel = "comments_rc"
-            text_edit = self._rec_text
-            prefix = "RC"
+            target = self._rec_text
         elif focus is self._byte_text:
             panel = "comments_bc"
-            text_edit = self._byte_text
-            prefix = "BC"
+            target = self._byte_text
         else:
             self.statusBar().showMessage(
                 "Clique no painel de bytecode ou código antes de comentar.", 3000)
             return
 
-        line = text_edit.textCursor().blockNumber()
-        key = str(line + 1)  # 1-based
+        if self._comment_editing:
+            self._finish_inline_comment(save=True)
+
+        line = target.textCursor().blockNumber()
+        key = str(line + 1)
         existing = self._annotations.get(panel, {}).get(key, "")
 
-        comment, ok = QInputDialog.getText(
-            self, "Comentário", f"Comentário para [{prefix}] L{line + 1}:",
-            text=existing,
-        )
-        if not ok:
+        block = target.document().findBlockByNumber(line)
+        displayed = block.text() if block.isValid() else ""
+
+        # Calcula o texto limpo (sem comentário inline já injetado)
+        if existing:
+            suffix = f"  # {existing}"
+            if displayed.endswith(suffix):
+                clean = displayed[:-len(suffix)]
+            else:
+                clean = displayed
+        else:
+            clean = displayed
+
+        self._comment_edit_original = clean
+        self._comment_edit_line = line
+        self._comment_edit_target = target
+        self._comment_edit_panel = panel
+
+        target.setReadOnly(False)
+        if not existing:
+            # Novo comentário: insere marcador
+            cursor = QTextCursor(block)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            cursor.insertText("  # ")
+            target.setTextCursor(cursor)
+        else:
+            # Comentário existente: posiciona no fim para edição
+            cursor = QTextCursor(block)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            target.setTextCursor(cursor)
+
+        self._comment_editing = True
+        self.statusBar().showMessage("Editando comentário — Enter p/ salvar, Esc p/ cancelar", 0)
+
+    def _finish_inline_comment(self, save: bool = True):
+        """Finaliza a edição inline do comentário."""
+        if not self._comment_editing:
             return
 
-        if comment.strip():
-            self._annotations.setdefault(panel, {})[key] = comment.strip()
+        target = self._comment_edit_target
+        line = self._comment_edit_line
+        panel = self._comment_edit_panel
+        clean = self._comment_edit_original
+
+        block = target.document().findBlockByNumber(line)
+        current_text = block.text() if block.isValid() else ""
+
+        comment = ""
+        if save:
+            # Tudo depois do texto limpo é a área de comentário
+            comment_area = current_text[len(clean):]
+            if comment_area.startswith("  # "):
+                comment = comment_area[4:].strip()
+
+        # Monta o texto final da linha: limpo + comentário (se houver)
+        final = clean
+        if comment:
+            final += f"  # {comment}"
+
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                            QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(final)
+
+        # Salva anotação
+        key = str(line + 1)
+        if comment:
+            self._annotations.setdefault(panel, {})[key] = comment
         else:
             self._annotations.get(panel, {}).pop(key, None)
+
+        target.setReadOnly(True)
+        self._comment_editing = False
+        self._comment_edit_target = None
 
         self._save_current_annotations()
         self._render_comment_highlights()
         self._refresh_comments_list()
-        self.statusBar().showMessage("Comentário salvo.", 2000)
+        if save and comment:
+            self.statusBar().showMessage("Comentário salvo.", 2000)
+        elif save:
+            self.statusBar().showMessage("Comentário removido.", 2000)
+        else:
+            self.statusBar().showMessage("Edição cancelada.", 2000)
 
     def _render_comment_highlights(self):
         """Aplica highlights verdes nas linhas com comentários."""
-        hl_color = "#1a3a2a" if _is_dark() else "#d0f0d0"
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor(hl_color))
-
         for panel, text_edit in [("comments_bc", self._byte_text),
                                   ("comments_rc", self._rec_text)]:
-            comments = self._annotations.get(panel, {})
-            selections = []
-            doc = text_edit.document()
-            for key, comment_text in comments.items():
-                try:
-                    line = int(key) - 1  # 0-based
-                except ValueError:
-                    continue
-                block = doc.findBlockByNumber(line)
-                if not block.isValid():
-                    continue
-                cursor = QTextCursor(block)
-                cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
-                                    QTextCursor.MoveMode.KeepAnchor)
-                sel = QTextEdit.ExtraSelection()
-                sel.format = fmt
-                sel.cursor = cursor
-                selections.append(sel)
-
-                # Tooltip no bloco
-                block_data = block.text()
-                # Não há API nativa de tooltip por bloco no QPlainTextEdit,
-                # mas podemos usar setToolTip no formato
-                fmt_tip = QTextCharFormat()
-                fmt_tip.setBackground(QColor(hl_color))
-                fmt_tip.setToolTip(f"# {comment_text}")
-                sel_tip = QTextEdit.ExtraSelection()
-                sel_tip.format = fmt_tip
-                sel_tip.cursor = cursor
-                selections[-1] = sel_tip
-
-            text_edit.setExtraSelections(selections)
+            text_edit.setExtraSelections(
+                self._comment_selections_for(panel, text_edit))
 
     def _refresh_comments_list(self):
         """Atualiza a lista de comentários no painel esquerdo."""
@@ -1505,22 +2019,23 @@ class MainWindow(QMainWindow):
                 self._list_comments.addItem(f"[{prefix}] L{key}: {text}")
 
     def _on_comment_click(self, item: QListWidgetItem):
-        """Navega ao clicar em um comentário na lista."""
+        """Navega ao clicar em um comentário na lista e exibe o texto."""
         text = item.text()
         if text.startswith("[BC]"):
             target = self._byte_text
+            panel = "comments_bc"
         elif text.startswith("[RC]"):
             target = self._rec_text
+            panel = "comments_rc"
             self._tree_funcs.setCurrentItem(self._view_all_item)
         else:
             return
 
-        # Extrai número da linha
-
         m = re.search(r"L(\d+):", text)
         if not m:
             return
-        line = int(m.group(1)) - 1  # 0-based
+        key = m.group(1)
+        line = int(key) - 1  # 0-based
 
         block = target.document().findBlockByNumber(line)
         if block.isValid():
@@ -1528,6 +2043,10 @@ class MainWindow(QMainWindow):
             target.setTextCursor(cursor)
             target.setFocus()
             target.centerCursor()
+
+        comment = self._annotations.get(panel, {}).get(key, "")
+        if comment:
+            self.statusBar().showMessage(f"# {comment}", 5000)
 
     # ------------------------------------------------------------------
     # Anotações — persistência
@@ -1537,12 +2056,9 @@ class MainWindow(QMainWindow):
         """Carrega anotações do arquivo .annotations.json."""
         path = self._path_input.text()
         if not path:
-            self._annotations = {"renames": {}, "comments_bc": {}, "comments_rc": {}}
+            self._annotations = {"renames": {}, "renames_local": {}, "comments_bc": {}, "comments_rc": {}}
             return
         self._annotations = load_annotations(path)
-        if self._annotations.get("renames"):
-            self._apply_renames_to_display()
-        self._refresh_comments_list()
 
     def _save_current_annotations(self):
         """Salva anotações no arquivo .annotations.json."""
@@ -1635,6 +2151,7 @@ class MainWindow(QMainWindow):
         s["strings"] = self._strings
         s["recovered_funcs"] = self._recovered_funcs
         s["recovered_full"] = self._recovered_full
+        s["bytecode_full"] = self._bytecode_full
         s["bookmarks"] = self._bookmarks
         s["annotations"] = self._annotations
         s["bc_line_to_func"] = self._bc_line_to_func
@@ -1646,6 +2163,9 @@ class MainWindow(QMainWindow):
         s["byte_scroll"] = self._byte_text.verticalScrollBar().value()
         s["rec_scroll"] = self._rec_text.verticalScrollBar().value()
         s["hex_scroll"] = self._hex_text.verticalScrollBar().value()
+        # Função selecionada na árvore de code objects
+        cur = self._tree_funcs.currentItem()
+        s["selected_func"] = cur.data(0, Qt.ItemDataRole.UserRole) if cur else None
 
     def _restore_session(self, sid: int):
         """Restaura o estado da sessão nos widgets."""
@@ -1665,8 +2185,9 @@ class MainWindow(QMainWindow):
         self._strings = s.get("strings", [])
         self._recovered_funcs = s.get("recovered_funcs", {})
         self._recovered_full = s.get("recovered_full", "")
+        self._bytecode_full = s.get("bytecode_full", "")
         self._bookmarks = s.get("bookmarks", [])
-        self._annotations = s.get("annotations", {"renames": {}, "comments_bc": {}, "comments_rc": {}})
+        self._annotations = s.get("annotations", {"renames": {}, "renames_local": {}, "comments_bc": {}, "comments_rc": {}})
         self._bc_line_to_func = s.get("bc_line_to_func", {})
         self._rc_line_to_func = s.get("rc_line_to_func", {})
         self._handlers = s.get("handlers", [])
@@ -1677,6 +2198,15 @@ class MainWindow(QMainWindow):
         self._lbl_format_info.setVisible(s.get("format_visible", False))
 
         self._populate_lists()
+        self._refresh_bookmarks()
+
+        # Restaura a função selecionada na árvore (antes de render highlights)
+        sel_func = s.get("selected_func")
+        if sel_func and sel_func != "__view_all__":
+            target = self._find_tree_item_by_name(sel_func)
+            if target:
+                self._tree_funcs.setCurrentItem(target)
+
         self._render_comment_highlights()
         self._refresh_comments_list()
         self._update_statusbar()
@@ -1698,15 +2228,45 @@ class MainWindow(QMainWindow):
         new_sid = self._tab_bar.tabData(idx)
         if new_sid is None or new_sid == self._active_sid:
             return
+        # Finaliza edição inline de comentário pendente antes de trocar
+        if self._comment_editing:
+            self._finish_inline_comment(save=True)
         if self._active_sid >= 0:
             self._save_session(self._active_sid)
         self._active_sid = new_sid
         self._restore_session(new_sid)
         self._show_main()
+        # Ajusta estado "busy" para refletir se há worker ainda rodando na aba destino.
+        self._set_busy(new_sid in self._workers)
+        # Força um ciclo de resize idêntico ao que "maximizar" faz — resolve
+        # offset cumulativo no hit-test que o restore deixa pendente em Qt.
+        QTimer.singleShot(0, self._force_relayout)
+
+    def _force_relayout(self):
+        """Replica o efeito de maximizar/restaurar a janela: reconcilia geometria.
+
+        Após _restore_session, Qt deixa eventos de layout pendentes que não
+        são drenados antes do primeiro clique — o hit-test de QListWidget e
+        QPlainTextEdit usa geometria antiga e os cliques caem ~20px abaixo
+        do item visível. Um resize real da janela dispara resizeEvent em
+        todos os filhos e força o relayout. Delta de 8 pixels é grande o
+        bastante para o Qt não coalescer como no-op.
+        """
+        if self.isMaximized() or self.isFullScreen():
+            return
+        size = self.size()
+        self.resize(size.width() + 8, size.height() + 8)
+        self.resize(size)
 
     def _close_tab(self, idx: int):
         """Fecha a aba indicada."""
+        # Finaliza edição inline de comentário pendente
+        if self._comment_editing:
+            self._finish_inline_comment(save=True)
         sid = self._tab_bar.tabData(idx)
+        # Garante que a sessão ativa tem dados atualizados antes de fechar
+        if sid == self._active_sid:
+            self._save_session(sid)
         session = self._sessions.get(sid, {})
         path = session.get("path", "")
         if path and session.get("annotations"):
@@ -1805,7 +2365,9 @@ class MainWindow(QMainWindow):
             annotations = session.get("annotations", {})
             if path and annotations:
                 save_annotations(path, annotations)
-        if self._worker and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait()
+        for worker in list(self._workers.values()):
+            if worker.isRunning():
+                worker.quit()
+                worker.wait()
+        self._workers.clear()
         super().closeEvent(event)
