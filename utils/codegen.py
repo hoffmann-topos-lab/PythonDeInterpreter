@@ -8,7 +8,6 @@ from utils.block_utils import (
 
 
 def _group_from_imports(import_lines):
-    """Agrupa 'from X import Y' consecutivos do mesmo módulo."""
     grouped = []
     pending_module = None
     pending_names = []
@@ -67,6 +66,30 @@ def generate_python_code(tree, debug=True):
             if bb.get("type") == "BasicBlock" and bb.get("id") == bid:
                 return bb.get("opnames") or []
         return []
+
+    def block_loop_after(ra, bid):
+        for bb in (ra.get("basic_blocks") or []):
+            if bb.get("type") == "BasicBlock" and bb.get("id") == bid:
+                return bb.get("loop_after")
+        return None
+
+    def block_last_jump_target(ra, bid):
+        for bb in (ra.get("basic_blocks") or []):
+            if bb.get("type") == "BasicBlock" and bb.get("id") == bid:
+                return bb.get("last_jump_target")
+        return None
+
+    def block_op_argreprs(ra, bid):
+        for bb in (ra.get("basic_blocks") or []):
+            if bb.get("type") == "BasicBlock" and bb.get("id") == bid:
+                return bb.get("op_argreprs") or []
+        return []
+
+    def block_id_at_offset(ra, offset):
+        for bb in (ra.get("basic_blocks") or []):
+            if bb.get("type") == "BasicBlock" and bb.get("start") == offset:
+                return bb.get("id")
+        return None
 
     def _extract_defaults(node):
         """Extrai defaults e kwdefaults do nó (preenchidos pelo extract.py)."""
@@ -164,9 +187,11 @@ def generate_python_code(tree, debug=True):
         parts = []
 
         # Argumentos posicionais (com defaults para os últimos N)
-        pos_args = varnames[:argc]
+        # `.0` é um slot de cell/closure implícito em MicroPython (p.ex. `__class__`
+        # para `super()`); não é arg visível ao usuário, filtramos do signature.
+        pos_args = [n for n in varnames[:argc] if n != ".0"]
         n_defaults = len(pos_defaults)
-        first_default_idx = argc - n_defaults  # defaults aplicam-se aos últimos N args
+        first_default_idx = len(pos_args) - n_defaults
         for i, name in enumerate(pos_args):
             if i >= first_default_idx and n_defaults > 0:
                 default_val = pos_defaults[i - first_default_idx]
@@ -212,6 +237,9 @@ def generate_python_code(tree, debug=True):
             if t in (f"del{exc_var}", f"del({exc_var})"):
                 return True
             if t in (f"{exc_var}=exc", f"{exc_var}=exc_info", f"{exc_var}=<exc:exc>"):
+                return True
+            # MicroPython: binding inicial `<exc_var> = <?>` do DUP_TOP da exceção
+            if t == f"{exc_var}=<?>":
                 return True
         if "(None,None,None)" in t:
             return True
@@ -262,6 +290,83 @@ def generate_python_code(tree, debug=True):
                 if st.target == suppress_with_as and isinstance(st.expr, Expr) and st.expr.kind == "with_enter":
                     i += 1
                     continue
+
+            # Swap / tuple-assign: N assigns consecutivos onde algum RHS referencia outro target da sequência,
+            # e todos os LOADs (origins do RHS) ocorrem antes de todos os STOREs (origins do stmt).
+            if (isinstance(st, Stmt) and st.kind == "assign"
+                    and isinstance(st.expr, Expr)
+                    and st.target):
+                swap_stmts = [st]
+                j = i + 1
+                while j < len(stmts):
+                    nxt = stmts[j]
+                    if not (isinstance(nxt, Stmt) and nxt.kind == "assign"
+                            and isinstance(nxt.expr, Expr)
+                            and nxt.target):
+                        break
+                    swap_stmts.append(nxt)
+                    j += 1
+                if len(swap_stmts) >= 2:
+                    tgts = [s.target for s in swap_stmts]
+                    if len(set(tgts)) == len(tgts):
+                        target_set = set(tgts)
+
+                        def _refs_any(e, names, _seen=None):
+                            if _seen is None:
+                                _seen = set()
+                            if not isinstance(e, Expr):
+                                return False
+                            eid = id(e)
+                            if eid in _seen:
+                                return False
+                            _seen.add(eid)
+                            if e.kind == "name" and str(e.value) in names:
+                                return True
+                            for a in e.args or ():
+                                if _refs_any(a, names, _seen):
+                                    return True
+                            return False
+
+                        cross_ref = False
+                        for k, s in enumerate(swap_stmts):
+                            others = target_set - {tgts[k]}
+                            if _refs_any(s.expr, others):
+                                cross_ref = True
+                                break
+
+                        if cross_ref:
+                            def _collect(e, acc, _seen=None):
+                                if _seen is None:
+                                    _seen = set()
+                                if not isinstance(e, Expr):
+                                    return
+                                eid = id(e)
+                                if eid in _seen:
+                                    return
+                                _seen.add(eid)
+                                if e.origins:
+                                    acc |= e.origins
+                                for a in e.args or ():
+                                    _collect(a, acc, _seen)
+
+                            load_origins = set()
+                            store_origins = set()
+                            origins_ok = True
+                            for s in swap_stmts:
+                                _collect(s.expr, load_origins)
+                                so = s.origins or frozenset()
+                                if not so:
+                                    origins_ok = False
+                                    break
+                                store_origins |= so
+                            if (origins_ok and load_origins and store_origins
+                                    and max(load_origins) < min(store_origins)):
+                                lhs = ", ".join(tgts)
+                                rhs = ", ".join(expr_repr(s.expr) for s in swap_stmts)
+                                emit(lines, f"{lhs} = {rhs}", level)
+                                wrote = True
+                                i = j
+                                continue
 
             if isinstance(st, Stmt) and st.kind == "assign" and isinstance(st.expr, Expr):
                 if st.expr.kind in ("const", "name", "global_name"):
@@ -564,7 +669,7 @@ def generate_python_code(tree, debug=True):
                 stmts = get_block_statements(node, bid)
                 for st in stmts:
                     if isinstance(st, Stmt) and st.kind == "assign":
-                        if st.target in ("__module__", "__qualname__"):
+                        if st.target in ("__module__", "__qualname__", "__classcell__"):
                             continue
                         if st.target in child_names_cls:
                             continue
@@ -637,6 +742,9 @@ def generate_python_code(tree, debug=True):
 
         sc_blocks = set(ra.get("short_circuit_blocks") or [])
         yf_blocks = set(get_stack_info(node).get("yield_from_blocks") or [])
+        # blocos que foram deferidos por `_render_else_or_elif` (latch-bypass do while),
+        # para o render_region NÃO marcá-los como visitados.
+        deferred_else_bids = set()
 
         ifs = find_structs(ra, "If")
         if_by_cond = {x.get("cond_block"): x for x in ifs if x.get("cond_block") is not None}
@@ -651,6 +759,17 @@ def generate_python_code(tree, debug=True):
             if lp_latches and lp_latches.issubset(yf_blocks):
                 continue
             loop_by_header[x.get("header")] = x
+
+        # Mapa body_block → header para loops cujo body precede o header em offset
+        # (padrão MicroPython `while`: JUMP forward para cond; body; cond backward para body).
+        # Permite que render_region dispare render_loop a partir do primeiro body block.
+        body_to_loop_header = {}
+        for _hdr, _lp in loop_by_header.items():
+            _hdr_start = -1
+            for _b in (_lp.get("body_blocks") or []):
+                if _b == _hdr:
+                    continue
+                body_to_loop_header[_b] = _hdr
 
         tefs = find_structs(ra, "TryExceptFinally")
         tef_by_entry = {}
@@ -826,6 +945,24 @@ def generate_python_code(tree, debug=True):
 
                     saved = tef_by_entry.pop(bid, None)
 
+                    # Em try/finally puro (sem except), um `return <expr>` que
+                    # aparece como post_finally_stmts vem do RETURN_VALUE inline
+                    # depois do código do finally no bytecode. Semanticamente é
+                    # o return que estava DENTRO do try — CPython 3.12 duplica
+                    # o finally e coloca o RETURN_VALUE depois, mas na fonte
+                    # original o return está no try. Deslocamos de volta para
+                    # que a recuperação seja idiomática.
+                    inline_return_stmts = []
+                    if not handlers:
+                        post_stmts_preview = list(t.get("post_finally_stmts") or [])
+                        for _st in post_stmts_preview:
+                            if (isinstance(_st, Stmt) and _st.kind == "return"
+                                    and _st.expr is not None
+                                    and not (isinstance(_st.expr, Expr)
+                                             and _st.expr.kind == "const"
+                                             and _st.expr.value is None)):
+                                inline_return_stmts.append(_st)
+
                     emit(lines, "try:", level)
                     wrote_any = True
 
@@ -833,6 +970,13 @@ def generate_python_code(tree, debug=True):
                         render_region(lines, try_blocks, level + 1, in_finally=False, in_except=False)
                     else:
                         emit(lines, "pass", level + 1)
+
+                    if inline_return_stmts:
+                        # Remove placeholder `pass` se for o único conteúdo
+                        while lines and lines[-1].strip() == "pass":
+                            lines.pop()
+                        emit_statements(lines, inline_return_stmts, level + 1,
+                                        in_finally=False, in_except=False)
 
                     # Renderiza cada except handler
                     all_handler_blocks = []
@@ -898,6 +1042,10 @@ def generate_python_code(tree, debug=True):
 
                     # Emite stmts de continuação pós-try (ex: return value após finally)
                     post_stmts = list(t.get("post_finally_stmts") or [])
+                    if inline_return_stmts:
+                        # Já foram emitidos dentro do try body
+                        _returned_ids = {id(s) for s in inline_return_stmts}
+                        post_stmts = [s for s in post_stmts if id(s) not in _returned_ids]
                     if post_stmts:
                         emit_statements(lines, post_stmts, level,
                                         in_finally=False, in_except=False)
@@ -1141,6 +1289,22 @@ def generate_python_code(tree, debug=True):
                     wrote_any = True
                     continue
 
+                # LOOP com body antes do header (padrão MicroPython `while`):
+                # se encontramos um body block cujo header ainda não foi renderizado,
+                # dispara render_loop pelo header. Só vale quando o header está na
+                # região atual e ainda não foi visitado.
+                if bid in body_to_loop_header:
+                    _hdr = body_to_loop_header[bid]
+                    if _hdr not in visited and _hdr in loop_by_header:
+                        _hdr_lp = loop_by_header[_hdr]
+                        _body_set = set(_hdr_lp.get("body_blocks") or [])
+                        # Verifica que o header está na região atual (não pula para loops externos)
+                        if _hdr in set(region_ids):
+                            visited.add(_hdr)
+                            render_loop(lines, _hdr, _hdr_lp, level)
+                            wrote_any = True
+                            continue
+
                 # IF (caso especial: latch do while no mesmo bloco do corpo)
                 if bid in if_by_cond:
                     # Suprime blocos de short-circuit (COPY+POP_JUMP): já resolvidos em and/or
@@ -1184,7 +1348,10 @@ def generate_python_code(tree, debug=True):
                         loop_cond_expr=loop_cond_expr, loop_header_bid=loop_header_bid
                     )
                     # Marca sub-blocos do if como visitados para o loop externo não re-renderizá-los
+                    # — exceto blocos deferidos (latch-bypass do while) que o render_region tratará.
                     for _b in list((iff.get("then_blocks") or []) + (iff.get("else_blocks") or [])):
+                        if _b in deferred_else_bids:
+                            continue
                         visited.add(_b)
                     wrote_any = True
                     continue
@@ -1192,6 +1359,15 @@ def generate_python_code(tree, debug=True):
                 # Suprime bloco de plumbing do short-circuit (POP_TOP fall-through)
                 if bid in sc_blocks:
                     visited.add(bid)
+                    # Se o bloco de merge contém atribuições resolvidas pela SC
+                    # (ex: `x = a or b or c` no início da próxima cadeia encadeada),
+                    # emite os stmts antes de suprimir. Caso contrário a atribuição
+                    # se perderia (#M17).
+                    sc_stmts = get_block_statements(node, bid) or []
+                    if sc_stmts:
+                        if emit_statements(lines, sc_stmts, level,
+                                           in_finally=in_finally, in_except=in_except, exc_var=exc_var):
+                            wrote_any = True
                     continue
 
                 # BLOCO "normal"
@@ -1229,6 +1405,38 @@ def generate_python_code(tree, debug=True):
                         if (st.target and isinstance(st.expr, Expr) and st.expr.kind == "name"
                                 and st.expr.value == st.target):
                             continue
+                        # Detecta class local: target = __build_class__(make_function(body), 'Name', *bases)
+                        _bc_expr = st.expr
+                        if (isinstance(_bc_expr, Expr) and _bc_expr.kind in ("call", "call_kw", "call_ex")
+                                and _bc_expr.args and len(_bc_expr.args) >= 3):
+                            _bc_fn = _bc_expr.args[0]
+                            if (isinstance(_bc_fn, Expr) and _bc_fn.kind == "name"
+                                    and _bc_fn.value == "__build_class__"):
+                                _bc_target = st.target
+                                _bc_ch_list = _ch_by_name.get(_bc_target)
+                                if _bc_ch_list:
+                                    _bc_idx = _ch_emit_idx.get(_bc_target, 0)
+                                    if _bc_idx < len(_bc_ch_list):
+                                        _bc_ch = _bc_ch_list[_bc_idx]
+                                        _ch_emit_idx[_bc_target] = _bc_idx + 1
+                                        _bc_bases = list(_bc_expr.args[3:])
+                                        _flush_pending()
+                                        if _bc_bases:
+                                            _bases_txt = ", ".join(
+                                                expr_repr(b) if isinstance(b, Expr) else str(b)
+                                                for b in _bc_bases
+                                            )
+                                            emit(lines, f"class {_bc_target}({_bases_txt}):", level)
+                                        else:
+                                            emit(lines, f"class {_bc_target}:", level)
+                                        _body_lines = render_code_object(_bc_ch)
+                                        if _body_lines:
+                                            for _ln in _body_lines:
+                                                emit(lines, _ln, level + 1)
+                                        else:
+                                            emit(lines, "pass", level + 1)
+                                        wrote_any = True
+                                        continue
                         # Tenta extrair make_function (possivelmente envolto em decorators)
                         _expr = st.expr
                         _decos = []
@@ -1252,15 +1460,22 @@ def generate_python_code(tree, debug=True):
                             continue
                         _target = st.target
                         _ch_list = _ch_by_name.get(_target)
-                        if not _ch_list:
+                        _ch = None
+                        if _ch_list:
+                            _idx = _ch_emit_idx.get(_target, 0)
+                            if _idx < len(_ch_list):
+                                _ch = _ch_list[_idx]
+                                _ch_emit_idx[_target] = _idx + 1
+                        if _ch is None:
+                            # Fallback: st.target não é o nome do child (ex: MicroPython
+                            # closure assigns para _local_N). Resolve via make_function(idx).
+                            _child_idx = _expr.value
+                            _children_list = node.get("children", []) or []
+                            if isinstance(_child_idx, int) and 0 <= _child_idx < len(_children_list):
+                                _ch = _children_list[_child_idx]
+                        if _ch is None:
                             _pending.append(st)
                             continue
-                        _idx = _ch_emit_idx.get(_target, 0)
-                        if _idx >= len(_ch_list):
-                            _pending.append(st)
-                            continue
-                        _ch = _ch_list[_idx]
-                        _ch_emit_idx[_target] = _idx + 1
                         # Flush statements pendentes antes de emitir o def
                         _flush_pending()
                         # Emite decorators (outermost first)
@@ -1342,23 +1557,28 @@ def generate_python_code(tree, debug=True):
 
             def _is_for_break_region(bids):
                 """Verifica se a região é um break de for-loop (POP_TOP + exit)."""
+                return _for_break_user_stmts(bids) is not None
+
+            def _for_break_user_stmts(bids):
+                """Se bids é um break de for-loop, retorna a lista de stmts de usuário
+                que precedem o break (possivelmente vazia). Retorna None se não for break."""
                 if not bids or loop_meta is None:
-                    return False
-                for bid in bids:
-                    ops = set(block_opnames(ra, bid))
-                    stmts = get_block_statements(node, bid) or []
-                    # Break em for-loop: POP_TOP (pop iterador) + saída (RETURN_CONST/RETURN_VALUE)
-                    if "POP_TOP" in ops and ops & {"RETURN_CONST", "RETURN_VALUE", "JUMP_FORWARD"}:
-                        # Verifica que os statements são apenas return None (epílogo de break)
-                        real = [s for s in stmts if not is_plumbing_stmt_text(
-                            stmt_repr(s).strip(), in_except=in_except, exc_var=exc_var, in_finally=in_finally)]
-                        if not real:
-                            return True
-                        if len(real) == 1 and real[0].kind == "return":
-                            e = real[0].expr
-                            if isinstance(e, Expr) and e.kind == "const" and e.value is None:
-                                return True
-                return False
+                    return None
+                if len(bids) != 1:
+                    return None
+                bid = bids[0]
+                ops = set(block_opnames(ra, bid))
+                if not ("POP_TOP" in ops and ops & {"RETURN_CONST", "RETURN_VALUE", "JUMP_FORWARD"}):
+                    return None
+                stmts = get_block_statements(node, bid) or []
+                real = [s for s in stmts if not is_plumbing_stmt_text(
+                    stmt_repr(s).strip(), in_except=in_except, exc_var=exc_var, in_finally=in_finally)]
+                # Remove return None trailing (epílogo de break)
+                if real and isinstance(real[-1], Stmt) and real[-1].kind == "return":
+                    e = real[-1].expr
+                    if isinstance(e, Expr) and e.kind == "const" and e.value is None:
+                        real = real[:-1]
+                return real
 
             if loop_set is not None:
                 then_has = region_has_emittable_stmts(then_ids, in_finally=in_finally, in_except=in_except, exc_var=exc_var)
@@ -1386,8 +1606,12 @@ def generate_python_code(tree, debug=True):
                     return
 
                 # BREAK (for-loop): then-branch tem POP_TOP + saída do loop
-                if _is_for_break_region(then_ids):
+                _fb_stmts = _for_break_user_stmts(then_ids)
+                if _fb_stmts is not None:
                     emit(lines, f"if {cond_txt}:", level)
+                    if _fb_stmts:
+                        emit_statements(lines, _fb_stmts, level + 1,
+                                        in_finally=in_finally, in_except=in_except, exc_var=exc_var)
                     emit(lines, "break", level + 1)
                     else_has = region_has_emittable_stmts(else_ids, in_finally=in_finally, in_except=in_except, exc_var=exc_var)
                     if else_ids and else_has:
@@ -1462,6 +1686,19 @@ def generate_python_code(tree, debug=True):
             # Detecta elif: o primeiro bloco do else é cond_block de outro If,
             # e os demais blocos são parte dessa mesma estrutura if (then + else)
             first_else = else_ids[0] if else_ids else None
+
+            # Latch-bypass do while: se estamos num loop e o primeiro else é um
+            # cond_block cuja condição bate com a do while e NÃO é o header,
+            # este é o teste duplicado da inversão de loop — NÃO renderiza elif;
+            # deixa para o render_region tratar os stmts fora do if.
+            if (loop_cond_expr is not None and first_else is not None
+                    and first_else in if_by_cond
+                    and first_else != loop_header_bid):
+                fe_cond = get_block_condition(node, first_else, 0)
+                if fe_cond is not None and same_cond(fe_cond, loop_cond_expr):
+                    deferred_else_bids.update(else_ids)
+                    return
+
             can_elif = False
             if first_else is not None and first_else in if_by_cond and first_else not in assert_by_cond:
                 next_if = if_by_cond[first_else]
@@ -1515,6 +1752,168 @@ def generate_python_code(tree, debug=True):
                 loop_cond_expr=loop_cond_expr, loop_header_bid=loop_header_bid,
             )
 
+        def _detect_for_else_bid(header_bid, body, loop_set):
+            """Retorna o bid do bloco de else do for-loop, ou None.
+
+            Em CPython 3.12, break em for/else é compilado como:
+              (a) POP_TOP + JUMP_FORWARD pulando além do else body; ou
+              (b) POP_TOP + RETURN_* quando o alvo pós-else é também um retorno
+                  (otimização de inlining). Neste caso, só há else real se o
+                  conteúdo (statements de usuário) do bloco pós-END_FOR for
+                  DIFERENTE do conteúdo de todos os blocos de break.
+            """
+            exit_off = None
+            for bb in body:
+                if bb == header_bid:
+                    continue
+                la = block_loop_after(ra, bb)
+                if la is not None:
+                    exit_off = la
+                    break
+            if exit_off is None:
+                la = block_loop_after(ra, header_bid)
+                if la is not None:
+                    exit_off = la
+            if exit_off is None:
+                return None
+            else_bid = block_id_at_offset(ra, exit_off)
+            if else_bid is None or else_bid in visited or else_bid in loop_set:
+                return None
+
+            # Acha blocos de break: loop_after == exit_off, não são else_bid,
+            # não são blocos do corpo/loop e não são latches (JUMP_BACKWARD).
+            loop_body_set = set(body) | {header_bid}
+            break_bids = []
+            for bb in (ra.get("basic_blocks") or []):
+                if bb.get("type") != "BasicBlock":
+                    continue
+                bbid = bb.get("id")
+                if bbid == else_bid or bbid in loop_body_set:
+                    continue
+                if bb.get("loop_after") != exit_off:
+                    continue
+                ops = bb.get("opnames") or []
+                opset = set(ops)
+                if "JUMP_BACKWARD" in opset:
+                    continue
+                if not (opset & {"RETURN_CONST", "RETURN_VALUE", "JUMP_FORWARD"}):
+                    continue
+                break_bids.append(bbid)
+
+            if not break_bids:
+                return None
+
+            # (a) algum break usa JUMP_FORWARD que pula ALÉM de exit_off → else real
+            for bbid in break_bids:
+                if "JUMP_FORWARD" in set(block_opnames(ra, bbid)):
+                    jt = block_last_jump_target(ra, bbid)
+                    if jt is not None and jt > exit_off:
+                        return else_bid
+
+            # (b) Comparação instrução-a-instrução: strip leading END_FOR no
+            # else_bid e POP_TOP(s) iniciais/antes do return no break. Se as
+            # instruções (opname, argrepr) baterem, break inlineou o else → no else.
+            def _strip_leading(ops, leading):
+                if ops and ops[0][0] == leading:
+                    return ops[1:]
+                return ops
+
+            def _break_tail(ops):
+                # Remove um POP_TOP (cleanup do iterador). Escolhe o POP_TOP mais
+                # próximo do terminal (último POP_TOP antes do RETURN/JUMP final),
+                # pois é esse que corresponde ao cleanup do iterador no break.
+                if not ops:
+                    return ops
+                last = ops[-1][0] if ops else ""
+                if last in ("RETURN_CONST", "RETURN_VALUE", "JUMP_FORWARD"):
+                    # procura POP_TOP do fim pra frente
+                    for i in range(len(ops) - 2, -1, -1):
+                        if ops[i][0] == "POP_TOP":
+                            return ops[:i] + ops[i+1:]
+                return ops
+
+            else_tail = _strip_leading(block_op_argreprs(ra, else_bid), "END_FOR")
+            # Se else_tail for só um RETURN trivial, não há else real
+            if len(else_tail) == 1 and else_tail[0][0] in ("RETURN_CONST", "RETURN_VALUE"):
+                return None
+
+            all_match = True
+            for bbid in break_bids:
+                btail = _break_tail(block_op_argreprs(ra, bbid))
+                if btail != else_tail:
+                    all_match = False
+                    break
+            if all_match:
+                return None
+            return else_bid
+
+        def _detect_while_else_bid(header_bid, body, loop_set, loop_cond_expr):
+            """Detecta o bloco de else em um while/else.
+            Regra: o bloco de saída do loop (false_succ do header cond) tem stmts
+            de usuário únicos, e existe pelo menos um caminho de break no corpo
+            cujos stmts divergem do else.
+            """
+            if header_bid not in if_by_cond or loop_cond_expr is None:
+                return None
+            h_if = if_by_cond[header_bid]
+            false_succ = h_if.get("false_succ")
+            if false_succ is None or false_succ in loop_set or false_succ in visited:
+                return None
+            else_bid = false_succ
+
+            def _user_stmts(bbid):
+                stmts = get_block_statements(node, bbid) or []
+                out = []
+                for s in stmts:
+                    txt = stmt_repr(s).strip()
+                    if is_plumbing_stmt_text(txt, in_except=False, exc_var=None, in_finally=False):
+                        continue
+                    out.append(s)
+                # remove trailing `return None` (epílogo natural)
+                if out and isinstance(out[-1], Stmt) and out[-1].kind == "return":
+                    e = out[-1].expr
+                    if isinstance(e, Expr) and e.kind == "const" and e.value is None:
+                        out = out[:-1]
+                return [stmt_repr(s).strip() for s in out]
+
+            else_u = _user_stmts(else_bid)
+            # Sem user stmts (ou só `return None` trivial) → não há else real.
+            if not else_u:
+                return None
+
+            # Coleta caminhos de break: blocos com RETURN_*/JUMP_FORWARD fora do
+            # loop_set e fora do else_bid (os exits internos do loop).
+            # Nota: não excluímos blocos já `visited`, pois o corpo do loop já
+            # processou blocos internos (ex: `if x: return`) e marcou-os.
+            break_bids = []
+            for bb in (ra.get("basic_blocks") or []):
+                if bb.get("type") != "BasicBlock":
+                    continue
+                bbid = bb.get("id")
+                if bbid in loop_set or bbid == else_bid:
+                    continue
+                ops = bb.get("opnames") or []
+                opset = set(ops)
+                if "JUMP_BACKWARD" in opset:
+                    continue
+                if not (opset & {"RETURN_CONST", "RETURN_VALUE", "JUMP_FORWARD"}):
+                    continue
+                break_bids.append(bbid)
+
+            # Sem break algum → else seria semanticamente igual ao pós-loop.
+            if not break_bids:
+                return None
+
+            # Se TODOS os breaks têm mesmos stmts que else_bid, não há else real.
+            all_match = True
+            for bbid in break_bids:
+                if _user_stmts(bbid) != else_u:
+                    all_match = False
+                    break
+            if all_match:
+                return None
+            return else_bid
+
         def render_loop(lines, header_bid, lp, level):
             body_all = sorted_region(lp.get("body_blocks") or [])
             body = [b for b in body_all if b != header_bid]
@@ -1548,12 +1947,49 @@ def generate_python_code(tree, debug=True):
                             break
                 if loop_var == "item" and body:
                     stmts0 = get_block_statements(node, body[0]) or []
+                    # Primeiro tenta detectar tuple unpacking: assigns consecutivos com unpack(i, next/anext)
+                    unpack_targets = []
+                    unpack_skip = []
+                    unpack_next_idx = 0
+                    unpack_seq_repr = None
                     for st in stmts0:
-                        if isinstance(st, Stmt) and st.kind == "assign" and isinstance(st.expr, Expr) and st.expr.kind in ("next", "anext"):
-                            loop_var = st.target or loop_var
-                            # Suprime "loop_var = next(iter(...))" do corpo — já codificado no header for
-                            _comp_skip_assign.setdefault(body[0], set()).add(loop_var)
+                        if not (isinstance(st, Stmt) and st.kind == "assign" and isinstance(st.expr, Expr)):
                             break
+                        e = st.expr
+                        inner_unpack = None
+                        is_starred = False
+                        if e.kind == "unpack":
+                            inner_unpack = e
+                        elif e.kind == "starred" and e.args and isinstance(e.args[0], Expr) and e.args[0].kind == "unpack":
+                            inner_unpack = e.args[0]
+                            is_starred = True
+                        if inner_unpack is None:
+                            break
+                        if inner_unpack.value != unpack_next_idx:
+                            break
+                        inner = inner_unpack.args[0] if inner_unpack.args else None
+                        if not (isinstance(inner, Expr) and inner.kind in ("next", "anext")):
+                            break
+                        cur_seq_repr = expr_repr(inner)
+                        if unpack_seq_repr is None:
+                            unpack_seq_repr = cur_seq_repr
+                        elif unpack_seq_repr != cur_seq_repr:
+                            break
+                        tgt = st.target or f"_unpack_{unpack_next_idx}"
+                        unpack_targets.append(f"*{tgt}" if is_starred else tgt)
+                        unpack_skip.append(tgt)
+                        unpack_next_idx += 1
+                    if len(unpack_targets) >= 2:
+                        loop_var = ", ".join(unpack_targets)
+                        for t in unpack_skip:
+                            _comp_skip_assign.setdefault(body[0], set()).add(t)
+                    else:
+                        for st in stmts0:
+                            if isinstance(st, Stmt) and st.kind == "assign" and isinstance(st.expr, Expr) and st.expr.kind in ("next", "anext"):
+                                loop_var = st.target or loop_var
+                                # Suprime "loop_var = next(iter(...))" do corpo — já codificado no header for
+                                _comp_skip_assign.setdefault(body[0], set()).add(loop_var)
+                                break
 
                 # Verifica se é comprehension inlined (PEP 709)
                 comp_type = None
@@ -1602,16 +2038,25 @@ def generate_python_code(tree, debug=True):
                                 break
                         break
 
-                # Extrai condição do filtro: bloco de corpo com COND mas sem LIST_APPEND
+                # Extrai condições de filtro: cada bloco do corpo com COND mas sem
+                # LIST_APPEND/SET_ADD/MAP_ADD é um `if` na comprehension (em source
+                # order). Múltiplos ifs → `[x for x in items if A if B if C]`.
+                comp_conds = []
                 if comp_type and comp_element is not None:
-                    for _fbid in body:
+                    for _fbid in sorted(body, key=lambda b: start_by_id.get(b, 0)):
                         _fcops = set(block_opnames(ra, _fbid))
-                        if ("LIST_APPEND" not in _fcops and "SET_ADD" not in _fcops and "MAP_ADD" not in _fcops):
-                            _fcond = get_block_condition(node, _fbid, 0)
-                            if _fcond is not None:
-                                comp_cond = _fcond
-                                _cond_bid = _fbid
-                                break
+                        if ("LIST_APPEND" in _fcops or "SET_ADD" in _fcops
+                                or "MAP_ADD" in _fcops):
+                            continue
+                        # FOR_ITER é o header do loop, não um filtro
+                        if "FOR_ITER" in _fcops:
+                            continue
+                        _fcond = get_block_condition(node, _fbid, 0)
+                        if _fcond is not None:
+                            comp_conds.append((_fbid, _fcond))
+                    if comp_conds:
+                        # Primeira condição permanece acessível para o caminho do ternário.
+                        _cond_bid, comp_cond = comp_conds[0]
 
                 if comp_type and comp_element is not None and not is_afor:
                     # Verifica se _fix_comprehensions já tratou esta compreensão
@@ -1626,7 +2071,7 @@ def generate_python_code(tree, debug=True):
                             continue
                         _pstmts = get_block_statements(node, _pbid) or []
                         for _ps in _pstmts:
-                            if isinstance(_ps, Stmt) and _ps.kind == "assign" and isinstance(_ps.expr, Expr):
+                            if isinstance(_ps, Stmt) and _ps.kind in ("assign", "return") and isinstance(_ps.expr, Expr):
                                 if _ps.expr.kind in ("list_comp", "set_comp", "dict_comp"):
                                     already_handled = True
                                     break
@@ -1658,7 +2103,10 @@ def generate_python_code(tree, debug=True):
                             comp_cond = None
                         else:
                             elem_txt = expr_repr(comp_element)
-                        cond_part = f" if {expr_repr(comp_cond)}" if comp_cond is not None else ""
+                        if len(comp_conds) >= 2:
+                            cond_part = "".join(f" if {expr_repr(_c)}" for (_, _c) in comp_conds)
+                        else:
+                            cond_part = f" if {expr_repr(comp_cond)}" if comp_cond is not None else ""
 
                         # Detecta nested comprehension: corpo do loop externo contém inner FOR_ITER
                         # ex: [x for row in outer for x in row]
@@ -1752,6 +2200,18 @@ def generate_python_code(tree, debug=True):
                     render_region(lines, body, level + 1, loop_set=loop_set, loop_meta=loop_meta, in_finally=False, in_except=False)
                 else:
                     emit(lines, "pass", level + 1)
+
+                # for/else: se o corpo contém break e o alvo natural do FOR_ITER
+                # (fall-through ao esgotar) tem stmts reais, esses stmts são o else.
+                _else_bid = _detect_for_else_bid(header_bid, body, loop_set)
+                if _else_bid is not None:
+                    _else_stmts = get_block_statements(node, _else_bid) or []
+                    _else_real = [s for s in _else_stmts if not is_plumbing_stmt_text(
+                        stmt_repr(s).strip(), in_except=False, exc_var=None, in_finally=False)]
+                    if _else_real:
+                        emit(lines, "else:", level)
+                        emit_statements(lines, _else_real, level + 1)
+                        visited.add(_else_bid)
                 return
 
             # WHILE: verifica se é while True (latch é uncondicional JUMP_BACKWARD)
@@ -1762,11 +2222,11 @@ def generate_python_code(tree, debug=True):
             latches = list(lp.get("latches") or [])
             is_while_true = False
             if cond_expr is not None and latches:
-                # Verifica se todos os latches são apenas JUMP_BACKWARD
+                # Verifica se todos os latches são apenas JUMP_BACKWARD (CPython) ou JUMP (MicroPython)
                 all_latch_unconditional = True
                 for latch_bid in latches:
                     latch_ops = set(block_opnames(ra, latch_bid))
-                    if not latch_ops.issubset({"JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "NOP"}):
+                    if not latch_ops.issubset({"JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "NOP", "JUMP"}):
                         all_latch_unconditional = False
                         break
                 if all_latch_unconditional:
@@ -1776,8 +2236,21 @@ def generate_python_code(tree, debug=True):
                         h_if = if_by_cond[header_bid]
                         then_bids = set(h_if.get("then_blocks") or [])
                         else_bids = set(h_if.get("else_blocks") or [])
-                        # Se then ou else contém blocos fora do loop -> break pattern
-                        if then_bids - loop_set or else_bids - loop_set:
+                        # Se then_blocks/else_blocks estão vazios (acontece quando o sucessor
+                        # direto é o join block), considera o sucessor direto como "saída"
+                        # para fins de decidir break vs. continue.
+                        _t_succ = h_if.get("true_succ")
+                        _f_succ = h_if.get("false_succ")
+                        then_exits = bool(then_bids - loop_set) or (
+                            not then_bids and _t_succ is not None and _t_succ not in loop_set
+                        )
+                        else_exits = bool(else_bids - loop_set) or (
+                            not else_bids and _f_succ is not None and _f_succ not in loop_set
+                        )
+                        # while True com break: o THEN branch sai do loop (break).
+                        # while cond: body: o ELSE branch é o exit, THEN entra no corpo.
+                        # Só é while True se THEN sai do loop E ELSE permanece dentro.
+                        if then_exits and not else_exits:
                             is_while_true = True
 
             if is_while_true:
@@ -1791,7 +2264,7 @@ def generate_python_code(tree, debug=True):
                     loop_cond_expr=None, loop_header_bid=header_bid
                 )
                 # Renderiza resto do body (excluindo header, latches puros e já visitados)
-                _latch_only = {"JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "NOP"}
+                _latch_only = {"JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "NOP", "JUMP"}
                 rest = [b for b in body if b not in visited
                         and not set(block_opnames(ra, b)).issubset(_latch_only)]
                 if rest:
@@ -1824,6 +2297,17 @@ def generate_python_code(tree, debug=True):
                         in_finally=False, in_except=False,
                         loop_cond_expr=cond_expr, loop_header_bid=header_bid
                     )
+                    # Detecta while/else: o bloco pós-loop (saída do cond) tem conteúdo
+                    # distinto de todo caminho de break/return dentro do corpo.
+                    _w_else_bid = _detect_while_else_bid(header_bid, body, loop_set, cond_expr)
+                    if _w_else_bid is not None:
+                        _we_stmts = get_block_statements(node, _w_else_bid) or []
+                        _we_real = [s for s in _we_stmts if not is_plumbing_stmt_text(
+                            stmt_repr(s).strip(), in_except=False, exc_var=None, in_finally=False)]
+                        if _we_real:
+                            emit(lines, "else:", level)
+                            emit_statements(lines, _we_real, level + 1)
+                            visited.add(_w_else_bid)
 
         # Emite global/nonlocal no início do corpo
         for g in global_decls:
@@ -1854,9 +2338,268 @@ def generate_python_code(tree, debug=True):
         if not any(ln.strip() for ln in out[1:]):
             emit(out, "pass", 1)
 
-        # Suprime 'return None' espúrio no final de generators.
-        # Em generators, o return None implícito no fim do bytecode nunca deve ser
-        # exibido — basta o gerador "sair" (raises StopIteration automaticamente).
+        # #7: remove 'return None' duplicado consecutivo no mesmo nível
+        i = 0
+        while i < len(out) - 1:
+            a = out[i].strip()
+            b = out[i + 1].strip()
+            a_ind = len(out[i]) - len(out[i].lstrip())
+            b_ind = len(out[i + 1]) - len(out[i + 1].lstrip())
+            if a == "return None" and b == "return None" and a_ind == b_ind:
+                del out[i + 1]
+                continue
+            i += 1
+
+        # #33: remove 'else: return None' no final da função quando o else é trivial
+        for i in range(len(out) - 1, 0, -1):
+            if not out[i].strip():
+                continue
+            if out[i].strip() != "return None":
+                break
+            prev = i - 1
+            while prev > 0 and not out[prev].strip():
+                prev -= 1
+            if out[prev].strip() != "else:":
+                break
+            else_ind = len(out[prev]) - len(out[prev].lstrip())
+            ret_ind = len(out[i]) - len(out[i].lstrip())
+            if ret_ind != else_ind + 4:
+                break
+            if any(out[k].strip() for k in range(prev + 1, i)):
+                break
+            if any(out[k].strip() for k in range(i + 1, len(out))):
+                break
+            del out[prev:i + 1]
+            break
+
+        # #18: colapsa `if cond: return E1; else: return E2` em `return E1 if cond else E2`.
+        # Também colapsa `if cond: x = E1; else: x = E2` em `x = E1 if cond else E2`.
+        # Aplicado apenas para if+else (2 branches). Chains com elif são deixadas intactas
+        # para preservar forma idiomática de funções como `multi_return`.
+        def _collapse_ternary(lines):
+            i = 0
+            while i < len(lines):
+                ln = lines[i]
+                st = ln.strip()
+                if not (st.startswith("if ") and st.endswith(":")):
+                    i += 1
+                    continue
+                if_ind = len(ln) - len(ln.lstrip())
+                cond = st[3:-1].strip()
+                # body do if
+                if_bs = i + 1
+                if_be = if_bs
+                while if_be < len(lines):
+                    bln = lines[if_be]
+                    bst = bln.strip()
+                    bind = len(bln) - len(bln.lstrip())
+                    if not bst:
+                        if_be += 1
+                        continue
+                    if bind <= if_ind:
+                        break
+                    if_be += 1
+                # else deve seguir imediatamente (pulando vazios)
+                j = if_be
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j >= len(lines):
+                    i += 1
+                    continue
+                eln = lines[j]
+                est = eln.strip()
+                eind = len(eln) - len(eln.lstrip())
+                if eind != if_ind or est != "else:":
+                    i += 1
+                    continue
+                el_bs = j + 1
+                el_be = el_bs
+                while el_be < len(lines):
+                    bln = lines[el_be]
+                    bst = bln.strip()
+                    bind = len(bln) - len(bln.lstrip())
+                    if not bst:
+                        el_be += 1
+                        continue
+                    if bind <= if_ind:
+                        break
+                    el_be += 1
+                if_body_idx = [k for k in range(if_bs, if_be) if lines[k].strip()]
+                el_body_idx = [k for k in range(el_bs, el_be) if lines[k].strip()]
+                if len(if_body_idx) != 1 or len(el_body_idx) != 1:
+                    i += 1
+                    continue
+                a_line = lines[if_body_idx[0]]
+                b_line = lines[el_body_idx[0]]
+                a_ind = len(a_line) - len(a_line.lstrip())
+                b_ind = len(b_line) - len(b_line.lstrip())
+                if a_ind != if_ind + 4 or b_ind != if_ind + 4:
+                    i += 1
+                    continue
+                a = a_line.strip()
+                b = b_line.strip()
+                new_line = None
+                if a.startswith("return ") and b.startswith("return "):
+                    ea = a[7:]
+                    eb = b[7:]
+                    new_line = " " * if_ind + f"return ({ea} if {cond} else {eb})"
+                elif " = " in a and " = " in b:
+                    ta, ea = a.split(" = ", 1)
+                    tb, eb = b.split(" = ", 1)
+                    if ta.strip() == tb.strip() and not any(
+                        op in ta for op in ("+=", "-=", "*=", "/=", "//=", "%=",
+                                             "**=", "&=", "|=", "^=", "<<=", ">>=")
+                    ):
+                        new_line = " " * if_ind + f"{ta.strip()} = ({ea} if {cond} else {eb})"
+                if new_line is None:
+                    i += 1
+                    continue
+                del lines[i:el_be]
+                lines.insert(i, new_line)
+                i += 1
+            return lines
+
+        out = _collapse_ternary(out)
+
+        # #11, #15 (nested comprehensions inline — PEP 709): quando uma comp é
+        # atribuída e o return seguinte é um `phi(...)` (phi-explosion do acumulador
+        # da comp), substitui por `return <comp>` e remove a atribuição.
+        def _collapse_comp_phi_return(lines):
+            i = 0
+            while i < len(lines) - 1:
+                a = lines[i]
+                a_strip = a.strip()
+                a_ind = len(a) - len(a.lstrip())
+                if " = " not in a_strip:
+                    i += 1
+                    continue
+                lhs, rhs = a_strip.split(" = ", 1)
+                lhs = lhs.strip()
+                if not lhs.isidentifier():
+                    i += 1
+                    continue
+                if not (rhs.startswith("[") or rhs.startswith("{") or rhs.startswith("(")):
+                    i += 1
+                    continue
+                # procurar próxima linha não vazia
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j >= len(lines):
+                    i += 1
+                    continue
+                b = lines[j]
+                b_strip = b.strip()
+                b_ind = len(b) - len(b.lstrip())
+                if b_ind != a_ind:
+                    i += 1
+                    continue
+                if not b_strip.startswith("return phi("):
+                    i += 1
+                    continue
+                # substitui: remove a atribuição e reescreve o return
+                new_return = " " * a_ind + "return " + rhs
+                del lines[i:j + 1]
+                lines.insert(i, new_return)
+                i += 1
+            return lines
+
+        out = _collapse_comp_phi_return(out)
+
+        # #32/#44: se if/elif/else termina com a MESMA última linha em todos os branches,
+        # remove essa linha de cada branch e emite uma única vez após o if inteiro.
+        def _collapse_tail_stmt(lines):
+            i = 0
+            while i < len(lines):
+                ln = lines[i]
+                stripped = ln.strip()
+                if not (stripped.startswith("if ") and stripped.endswith(":")):
+                    i += 1
+                    continue
+                if_ind = len(ln) - len(ln.lstrip())
+                branches = []
+                j = i
+                while j < len(lines):
+                    jln = lines[j]
+                    jst = jln.strip()
+                    jind = len(jln) - len(jln.lstrip())
+                    if not jst:
+                        j += 1
+                        continue
+                    if jind != if_ind:
+                        break
+                    if branches and not (jst.startswith("elif ") or jst == "else:"):
+                        break
+                    body_start = j + 1
+                    body_end = body_start
+                    while body_end < len(lines):
+                        bln = lines[body_end]
+                        bst = bln.strip()
+                        bind = len(bln) - len(bln.lstrip())
+                        if not bst:
+                            body_end += 1
+                            continue
+                        if bind <= if_ind:
+                            break
+                        body_end += 1
+                    kind = "if" if not branches else ("elif" if jst.startswith("elif ") else "else")
+                    branches.append((kind, j, body_start, body_end))
+                    j = body_end
+                if len(branches) < 2 or branches[-1][0] != "else":
+                    i += 1
+                    continue
+                tail_idx = []
+                tail_lines = []
+                body_ind_expected = if_ind + 4
+                ok = True
+                for (kind, h, bs, be) in branches:
+                    last_k = None
+                    for k in range(be - 1, bs - 1, -1):
+                        if lines[k].strip():
+                            last_k = k
+                            break
+                    if last_k is None:
+                        ok = False
+                        break
+                    li = len(lines[last_k]) - len(lines[last_k].lstrip())
+                    if li != body_ind_expected:
+                        ok = False
+                        break
+                    tail_idx.append(last_k)
+                    tail_lines.append(lines[last_k].strip())
+                if not ok:
+                    i += 1
+                    continue
+                first = tail_lines[0]
+                if not all(t == first for t in tail_lines):
+                    i += 1
+                    continue
+                if not (first.startswith("return ") or first == "return"
+                        or first in ("break", "continue")
+                        or first.startswith("raise ") or first == "raise"):
+                    i += 1
+                    continue
+                # Também exige pelo menos outra linha no body de cada branch (senão fica vazio)
+                has_other = True
+                for (kind, h, bs, be), tk in zip(branches, tail_idx):
+                    real_lines = [k for k in range(bs, be) if lines[k].strip() and k != tk]
+                    if not real_lines:
+                        has_other = False
+                        break
+                if not has_other:
+                    i += 1
+                    continue
+                # Remove as linhas tail em ordem reversa
+                for k in sorted(tail_idx, reverse=True):
+                    del lines[k]
+                new_end = branches[-1][3] - len(tail_idx)
+                tail_stmt = " " * if_ind + first
+                lines.insert(new_end, tail_stmt)
+                i = new_end + 1
+            return lines
+
+        out = _collapse_tail_stmt(out)
+
         is_generator_func = any(
             ("yield " in ln or ln.strip() == "yield"
              or "yield from " in ln)
