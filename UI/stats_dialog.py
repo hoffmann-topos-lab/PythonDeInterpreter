@@ -1,18 +1,13 @@
-"""Diálogo de estatísticas e overview do bytecode."""
-
 import os
 import re
-from collections import Counter
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QListWidget, QTabWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 
 class StatsDialog(QDialog):
-    """Diálogo com estatísticas gerais, distribuição de opcodes e imports."""
 
     def __init__(self, parent, bytecode_text: str, recovered_text: str,
                  meta: dict, file_path: str, elapsed: float):
@@ -28,10 +23,8 @@ class StatsDialog(QDialog):
             self._build_general(bytecode_text, recovered_text, meta, file_path, elapsed),
             "Geral",
         )
-        tabs.addTab(self._build_opcodes(bytecode_text), "Opcodes")
         tabs.addTab(self._build_imports(recovered_text), "Imports")
 
-    # ------------------------------------------------------------------
 
     def _build_general(self, bc, rc, meta, path, elapsed):
         w = QWidget()
@@ -76,30 +69,6 @@ class StatsDialog(QDialog):
         lay.addStretch()
         return w
 
-    # ------------------------------------------------------------------
-
-    def _build_opcodes(self, bc):
-        counter = self._count_opcodes(bc)
-        total = sum(counter.values())
-
-        table = QTableWidget(len(counter), 3)
-        table.setHorizontalHeaderLabels(["Opcode", "Contagem", "%"])
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSortingEnabled(True)
-
-        for row, (op, count) in enumerate(counter.most_common()):
-            table.setItem(row, 0, QTableWidgetItem(op))
-            item_count = QTableWidgetItem()
-            item_count.setData(Qt.ItemDataRole.DisplayRole, count)
-            table.setItem(row, 1, item_count)
-            pct = (count / total * 100) if total else 0
-            item_pct = QTableWidgetItem(f"{pct:.1f}%")
-            table.setItem(row, 2, item_pct)
-
-        return table
-
-    # ------------------------------------------------------------------
 
     def _build_imports(self, rc):
         w = QWidget()
@@ -122,10 +91,6 @@ class StatsDialog(QDialog):
         lay.addStretch()
         return w
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _count_instructions(bc: str) -> int:
         count = 0
@@ -135,30 +100,9 @@ class StatsDialog(QDialog):
                 continue
             if stripped.startswith(("Disassembly", "ExceptionTable", "(")):
                 continue
-            # CPython: "line?  offset  OPNAME ..." or MicroPython: "  OPNAME ..."
             parts = stripped.split()
             for p in parts:
                 if p == p.upper() and len(p) > 2 and re.match(r"[A-Z][A-Z_0-9]+$", p):
                     count += 1
                     break
         return count
-
-    @staticmethod
-    def _count_opcodes(bc: str) -> Counter:
-        counter: Counter = Counter()
-        for line in bc.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith(("Disassembly", "ExceptionTable", "(")):
-                continue
-            # CPython format: [line_no] offset OPNAME [args]
-            m = re.match(r"(?:\d+\s+)?(\d+)\s+([A-Z][A-Z_0-9]+)", stripped)
-            if m:
-                counter[m.group(2)] += 1
-                continue
-            # MicroPython format: OPNAME [args]
-            m = re.match(r"([A-Z][A-Z_0-9]+)", stripped)
-            if m:
-                counter[m.group(1)] += 1
-        return counter
