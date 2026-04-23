@@ -3,7 +3,7 @@ from typing import Any, List, Dict, Optional, Tuple, Set
 
 class StackValue:
     def __init__(self, origin):
-        self.origin = origin  # instr offset ou PHI
+        self.origin = origin 
 
     def __repr__(self):
         return f"V({self.origin})"
@@ -34,6 +34,37 @@ class Stmt:
     origins: frozenset = frozenset()
 
 
+def _collect_compare_chain(e):
+    def rec(x):
+        if not isinstance(x, Expr):
+            return None
+        if x.kind == "compare" and len(x.args) == 2:
+            return [(x.args[0], str(x.value) if x.value is not None else "?", x.args[1])]
+        if x.kind == "binop" and x.value == "and" and len(x.args) == 2:
+            L = rec(x.args[0])
+            if L is None:
+                return None
+            R = rec(x.args[1])
+            if R is None:
+                return None
+            return L + R
+        return None
+
+    chain = rec(e)
+    if chain is None or len(chain) < 2:
+        return None
+    for i in range(len(chain) - 1):
+        a_right = chain[i][2]
+        b_left = chain[i + 1][0]
+        if a_right is b_left:
+            continue
+        if isinstance(a_right, Expr) and isinstance(b_left, Expr):
+            if expr_repr(a_right) == expr_repr(b_left):
+                continue
+        return None
+    return chain
+
+
 def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
     if _seen is None:
         _seen = set()
@@ -46,9 +77,6 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
     eid = id(e)
     if eid in _seen:
         return "<cycle>"
-    # Cria novo set local (não muta o set do chamador) para que nós irmãos
-    # possam referenciar o mesmo objeto sem falso "<cycle>" (compartilhamento DAG).
-    # Ciclos verdadeiros (nó que aparece em seu próprio ancestral) ainda são detectados.
     _seen = _seen | {eid}
 
     if isinstance(e, (int, float, str, bool, type(None))):
@@ -71,6 +99,14 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
 
         if k == "binop":
             sym = str(e.value) if e.value is not None else "?"
+            if sym == "and" and len(a) == 2:
+                chain = _collect_compare_chain(e)
+                if chain is not None:
+                    parts = [expr_repr(chain[0][0], _seen, _depth + 1, _max_depth)]
+                    for (_L, op, R) in chain:
+                        parts.append(op)
+                        parts.append(expr_repr(R, _seen, _depth + 1, _max_depth))
+                    return "(" + " ".join(parts) + ")"
             left = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             right = expr_repr(a[1] if len(a) > 1 else None, _seen, _depth + 1, _max_depth)
             return f"({left} {sym} {right})"
@@ -104,8 +140,6 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
                 elems += ","
             return f"({elems})"
 
-        # --- Fase 1: attr, subscr, slice, unary, is, contains ---
-
         if k == "attr":
             obj = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             return f"{obj}.{e.value}"
@@ -124,8 +158,16 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
             return ":".join(parts)
 
         if k == "unary":
-            operand = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             op = str(e.value) if e.value else "?"
+            operand_e = a[0] if len(a) > 0 else None
+            if op == "not" and isinstance(operand_e, Expr) and operand_e.kind == "binop":
+                inner_op = operand_e.value
+                if inner_op in ("in", "is") and len(operand_e.args or ()) >= 2:
+                    left = expr_repr(operand_e.args[0], _seen, _depth + 1, _max_depth)
+                    right = expr_repr(operand_e.args[1], _seen, _depth + 1, _max_depth)
+                    neg_op = "not in" if inner_op == "in" else "is not"
+                    return f"({left} {neg_op} {right})"
+            operand = expr_repr(operand_e, _seen, _depth + 1, _max_depth)
             if op == "not":
                 return f"not {operand}"
             return f"({op}{operand})"
@@ -142,16 +184,12 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
             op = "not in" if e.value else "in"
             return f"({left} {op} {right})"
 
-        # --- Fase 2: import ---
-
         if k == "import":
             return f"__import__({e.value!r})"
 
         if k == "import_from":
             module = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             return f"{module}.{e.value}"
-
-        # --- Fase 3: set, dict, fstring, format ---
 
         if k == "set":
             elems = ", ".join(expr_repr(x, _seen, _depth + 1, _max_depth) for x in a)
@@ -195,11 +233,15 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
         if k == "format":
             inner = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             spec = e.value or ""
+            conv = ""
+            if a and len(a) > 1 and isinstance(a[1], Expr) and a[1].kind == "const":
+                cv = a[1].value
+                if cv == ord('s') or cv == 1: conv = "!s"
+                elif cv == ord('r') or cv == 2: conv = "!r"
+                elif cv == ord('a') or cv == 3: conv = "!a"
             if spec:
-                return f"format({inner}, {spec!r})"
-            return f"format({inner})"
-
-        # --- Fase 4: unpack, starred ---
+                return f'f"{{{inner}{conv}:{spec}}}"'
+            return f'f"{{{inner}{conv}}}"'
 
         if k == "unpack":
             src = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
@@ -209,7 +251,6 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
             inner = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             return f"*{inner}"
 
-        # --- Fase 5: make_function, closure_var, genexpr ---
 
         if k == "make_function":
             return f"<function>"
@@ -218,14 +259,9 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
             return str(e.value)
 
         if k in ("genexpr", "listcomp", "setcomp", "dictcomp"):
-            # Renderiza comprehension/genexpr com suporte a múltiplos for-clauses
-            # args: (element, var, iterable, *extras)
-            # extras pode conter Expr(kind="for_clause") e/ou condição
             elem_e = a[0] if len(a) > 0 else None
             var  = expr_repr(a[1] if len(a) > 1 else None, _seen, _depth + 1, _max_depth)
             src  = expr_repr(a[2] if len(a) > 2 else None, _seen, _depth + 1, _max_depth)
-
-            # Processa extras: for_clause e condição
             extra_fors = ""
             cond_str = ""
             for extra in a[3:]:
@@ -234,7 +270,7 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
                     es = expr_repr(extra.args[1], _seen, _depth + 1, _max_depth)
                     extra_fors += f" for {ev} in {es}"
                 elif extra is not None:
-                    cond_str = f" if {expr_repr(extra, _seen, _depth + 1, _max_depth)}"
+                    cond_str += f" if {expr_repr(extra, _seen, _depth + 1, _max_depth)}"
 
             clauses = f"for {var} in {src}{extra_fors}{cond_str}"
 
@@ -263,8 +299,6 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
             body = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
             return f"lambda {params}: {body}"
 
-        # --- Fase 7: yield, await, aiter, anext ---
-
         if k == "yield":
             inner = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             return f"(yield {inner})"
@@ -285,15 +319,11 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
             inner = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
             return f"anext({inner})"
 
-        # --- Fase 6: with ---
-
         if k == "with_enter":
             return expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
 
         if k in ("with_exit", "with_cleanup", "async_with_exit", "async_with_enter"):
             return expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
-
-        # --- Fase 8: match ---
 
         if k == "match_sequence":
             return f"isinstance({expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)}, Sequence)"
@@ -311,21 +341,23 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
         if k == "get_len":
             return f"len({expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)})"
 
-        # --- Fase 9: intrinsic ---
-
         if k == "intrinsic":
-            # Python 3.12 CALL_INTRINSIC_1 mappings
+
             iid = e.value
-            if iid == 4 and len(a) == 1:  # INTRINSIC_ASYNC_GEN_ASEND (transparent wrapper)
+            if iid == 4 and len(a) == 1:  
                 return expr_repr(a[0], _seen, _depth + 1, _max_depth)
-            if iid == 5 and len(a) == 1:  # INTRINSIC_UNARY_POSITIVE
+            if iid == 5 and len(a) == 1: 
                 return f"(+{expr_repr(a[0], _seen, _depth + 1, _max_depth)})"
-            if iid == 6 and len(a) == 1:  # INTRINSIC_LIST_TO_TUPLE
-                return f"tuple({expr_repr(a[0], _seen, _depth + 1, _max_depth)})"
+            if iid == 6 and len(a) == 1:  
+                inner = a[0]
+                if isinstance(inner, Expr) and inner.kind == "list":
+                    elems = ", ".join(expr_repr(x, _seen, _depth + 1, _max_depth) for x in inner.args)
+                    if len(inner.args) == 1:
+                        elems += ","
+                    return f"({elems})"
+                return f"tuple({expr_repr(inner, _seen, _depth + 1, _max_depth)})"
             inner = ", ".join(expr_repr(x, _seen, _depth + 1, _max_depth) for x in a)
             return f"intrinsic_{e.value}({inner})"
-
-        # --- Fase 10: call_kw, call_ex, list_append, list_extend ---
 
         if k == "call_kw":
             fn = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
@@ -349,7 +381,6 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
             args_t = expr_repr(a[1] if len(a) > 1 else None, _seen, _depth + 1, _max_depth)
             if len(a) > 2:
                 kw_arg = a[2]
-                # Simplifica {**x} → x: BUILD_MAP 0 + DICT_MERGE gera dict-unpack trivial
                 if (isinstance(kw_arg, Expr) and kw_arg.kind == "dict"
                         and getattr(kw_arg, "value", None) == "unpack"
                         and len(kw_arg.args or ()) == 2
@@ -362,35 +393,55 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
                 return f"{fn}(*{args_t}, **{kwargs_t})"
             return f"{fn}(*{args_t})"
 
+        if k == "ternary":
+            cond = expr_repr(a[0] if len(a) > 0 else None, _seen, _depth + 1, _max_depth)
+            then_v = expr_repr(a[1] if len(a) > 1 else None, _seen, _depth + 1, _max_depth)
+            else_v = expr_repr(a[2] if len(a) > 2 else None, _seen, _depth + 1, _max_depth)
+            return f"({then_v} if {cond} else {else_v})"
+
+        if k == "walrus":
+            inner = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
+            return f"({e.value} := {inner})"
+
         if k == "list_comp":
-            # args: (element, iterable) ou (element, iterable, cond)
-            # value: nome da variável de loop
             elem = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
             it = expr_repr(a[1] if len(a) > 1 else None, _seen, _depth + 1, _max_depth)
             var = str(e.value) if e.value else "_item"
+            for_kw = "for"
+            if var.startswith("async "):
+                for_kw = "async for"
+                var = var[len("async "):]
             cond_str = ""
             if len(a) > 2 and a[2] is not None:
                 cond_str = f" if {expr_repr(a[2], _seen, _depth + 1, _max_depth)}"
-            return f"[{elem} for {var} in {it}{cond_str}]"
+            return f"[{elem} {for_kw} {var} in {it}{cond_str}]"
 
         if k == "set_comp":
             elem = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
             it = expr_repr(a[1] if len(a) > 1 else None, _seen, _depth + 1, _max_depth)
             var = str(e.value) if e.value else "_item"
+            for_kw = "for"
+            if var.startswith("async "):
+                for_kw = "async for"
+                var = var[len("async "):]
             cond_str = ""
             if len(a) > 2 and a[2] is not None:
                 cond_str = f" if {expr_repr(a[2], _seen, _depth + 1, _max_depth)}"
-            return f"{{{elem} for {var} in {it}{cond_str}}}"
+            return f"{{{elem} {for_kw} {var} in {it}{cond_str}}}"
 
         if k == "dict_comp":
             key = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
             val = expr_repr(a[1] if len(a) > 1 else None, _seen, _depth + 1, _max_depth)
             it = expr_repr(a[2] if len(a) > 2 else None, _seen, _depth + 1, _max_depth)
             var = str(e.value) if e.value else "_item"
+            for_kw = "for"
+            if var.startswith("async "):
+                for_kw = "async for"
+                var = var[len("async "):]
             cond_str = ""
             if len(a) > 3 and a[3] is not None:
                 cond_str = f" if {expr_repr(a[3], _seen, _depth + 1, _max_depth)}"
-            return f"{{{key}: {val} for {var} in {it}{cond_str}}}"
+            return f"{{{key}: {val} {for_kw} {var} in {it}{cond_str}}}"
 
         if k == "list_append":
             lst = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
@@ -427,6 +478,15 @@ def expr_repr(e, _seen=None, _depth=0, _max_depth=50):
 
         if k == "kw_names":
             return f"<kw_names:{e.value}>"
+
+        if k == "kwarg":
+            val = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
+            name = e.value if e.value else "?"
+            return f"{name}={val}"
+
+        if k == "double_starred":
+            inner = expr_repr(a[0] if a else None, _seen, _depth + 1, _max_depth)
+            return f"**{inner}"
 
         inner = ", ".join(expr_repr(x, _seen, _depth + 1, _max_depth) for x in a)
         return f"{k}({inner})" if inner else f"{k}"
@@ -480,13 +540,10 @@ def stmt_repr(s: Stmt) -> str:
         return f"raise {expr_repr(s.expr)}"
 
     if s.kind == "reraise":
-        # RERAISE do bytecode
         return "raise"
 
     if s.kind == "del":
         return f"del {s.target}"
-
-    # --- Fase 1: store_attr, del_attr, store_subscr, del_subscr ---
 
     if s.kind == "store_attr":
         return f"{s.extra}.{s.target} = {expr_repr(s.expr) if s.expr else 'None'}"
@@ -499,8 +556,6 @@ def stmt_repr(s: Stmt) -> str:
 
     if s.kind == "del_subscr":
         return f"del {s.target}"
-
-    # --- Fase 2: import, import_from, import_star ---
 
     if s.kind == "import":
         module = s.extra if isinstance(s.extra, str) else str(s.extra)
@@ -525,8 +580,6 @@ def stmt_repr(s: Stmt) -> str:
     if s.kind == "import_star":
         return f"from {s.target} import *"
 
-    # --- Fase 7: yield, yield_from ---
-
     if s.kind == "yield":
         return f"yield {expr_repr(s.expr)}" if s.expr else "yield"
 
@@ -539,12 +592,8 @@ def stmt_repr(s: Stmt) -> str:
         return f"{s.target} = {inner}" if s.target else inner
 
     if s.kind == "async_for_item":
-        # Usado internamente por render_loop para reconstruir `async for var in iterable:`
-        # Nunca deve ser emitido diretamente; render_loop extrai target/expr daqui.
         iterable = expr_repr(s.expr) if s.expr else "<?>"
         return f"{s.target} = await anext({iterable})" if s.target else f"await anext({iterable})"
-
-    # --- Fase 10: with, async_with, assert, global, nonlocal ---
 
     if s.kind == "with":
         ctx = expr_repr(s.expr) if s.expr else "<?>"
