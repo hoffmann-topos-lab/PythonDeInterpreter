@@ -1,5 +1,5 @@
 from typing import Dict, List, Set, Any, Optional
-from utils.ir import Expr, Stmt
+from utils.ir import Expr, Stmt, expr_repr
 import dis
 from utils.block_utils import (
     build_block_by_id, build_offset_to_block,
@@ -11,6 +11,12 @@ from utils.handler_classify import (
 )
 
 _TERMINAL_OPS = {"RETURN_VALUE", "RETURN_CONST", "RERAISE", "RAISE_VARARGS"}
+
+
+def _expr_signature(e):
+    if not isinstance(e, Expr):
+        return ("raw", repr(e))
+    return (e.kind, repr(e.value), tuple(_expr_signature(a) for a in (e.args or ())))
 
 
 def block_has_terminal(bid: int, blocks_by_id: dict) -> bool:
@@ -62,14 +68,12 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
     if debug:
         print(f"[DEBUG] build_recovered_ast: {code_obj.co_name}")
 
-    # ---- indexação básica ----
     blocks_sorted = sorted(blocks, key=lambda b: b["start_offset"])
     blocks_by_id = build_block_by_id(blocks_sorted)
     start_by_id = {b["id"]: b["start_offset"] for b in blocks_sorted}
     all_nodes = set(blocks_by_id.keys())
     entry = blocks_sorted[0]["id"] if blocks_sorted else None
 
-    # cfg pode trazer dsts como set/list. Normalize.
     succ_all = {bid: set(cfg.get(bid, set())) for bid in all_nodes}
     pred_all = {bid: set() for bid in all_nodes}
     for s, dsts in succ_all.items():
@@ -77,10 +81,8 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             if d in pred_all:
                 pred_all[d].add(s)
 
-    # ---- map offset -> block id ----
     offset_to_block = build_offset_to_block(blocks_sorted)
 
-    # ---- exception table real (3.11+) ----
     exc_entries = []
     try:
         exc_entries = list(dis.Bytecode(code_obj).exception_entries)
@@ -96,32 +98,41 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
         return out
 
     try_regions = []
+
+    def _is_primary_handler(entry):
+        _hb = offset_to_block.get(entry.target)
+        if _hb is None:
+            return False
+        _hcls = classify_handler_block(blocks_by_id.get(_hb, {}))
+        if (_hcls["is_gen_cleanup"] or _hcls["is_exc_var_cleanup"]
+                or _hcls["is_with_handler"] or _hcls["is_with_reraise"]
+                or _hcls["is_comp_restore"] or _hcls["is_cleanup_throw"]
+                or _hcls["is_async_for_exit"]):
+            return False
+        if is_finally_exc_handler(_hb, blocks_by_id, succ_all):
+            return False
+        return True
+
+    any_primary = any(_is_primary_handler(e) for e in exc_entries)
+
     for e in exc_entries:
         prot = blocks_overlapping_range(e.start, e.end)
         hb = offset_to_block.get(e.target)
         if hb is not None:
             hcls = classify_handler_block(blocks_by_id.get(hb, {}))
-            # Filtra generator/coroutine cleanup handlers
             if hcls["is_gen_cleanup"]:
                 continue
-            # Filtra exception variable cleanup handlers (e=None; del e; reraise)
             if hcls["is_exc_var_cleanup"]:
                 continue
-            # Filtra with handler entries (WITH_EXCEPT_START ou with reraise)
             if hcls["is_with_handler"] or hcls["is_with_reraise"]:
                 continue
-            # Filtra comprehension restore handlers (PEP 709 inlined comprehensions)
             if hcls["is_comp_restore"]:
                 continue
-            # Filtra CLEANUP_THROW handlers (await/yield from coroutine cleanup)
             if hcls["is_cleanup_throw"]:
                 continue
-            # Filtra END_ASYNC_FOR handlers (async for StopAsyncIteration plumbing)
             if hcls["is_async_for_exit"]:
                 continue
-            # Filtra finally exception handlers (PUSH_EXC_INFO + código + RERAISE sem POP_EXCEPT)
-            # Esses handlers protegem o else/except/plumbing e são associados ao try principal
-            if is_finally_exc_handler(hb, blocks_by_id, succ_all):
+            if is_finally_exc_handler(hb, blocks_by_id, succ_all) and any_primary:
                 continue
         try_regions.append(
             {
@@ -135,16 +146,11 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             }
         )
 
-    # ---- Expande try_regions cujos protected_blocks são todos pure-cleanup ----
-    # Quando o bloco protegido é COPY+POP_EXCEPT+RERAISE, é infraestrutura de re-raise
-    # de um try/except interno. Expandimos para incluir todos os blocos que re-fazem
-    # raise através desse cleanup block, obtendo o corpo real do try externo.
+
     for tr in try_regions:
         prot = tr.get("protected_blocks", [])
         if not prot or not all(is_pure_cleanup_block(blocks_by_id.get(bid, {})) for bid in prot):
             continue
-        # Expande via cadeia reversa de exc_entries:
-        # blocos que lançam exceção que chega ao cleanup block (prot[i]) via entries.
         expanded = set(prot)
         worklist = list(prot)
         while worklist:
@@ -157,8 +163,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                     if nb not in expanded:
                         expanded.add(nb)
                         worklist.append(nb)
-        # Inclui o bloco de entrada da função (RESUME/NOP) se for predecessor normal
-        # de algum bloco expandido — garante entry_bid diferente do try interno.
         if blocks_sorted:
             entry_blk = blocks_sorted[0]
             entry_id = entry_blk["id"]
@@ -169,14 +173,12 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                         expanded.add(entry_id)
         tr["protected_blocks"] = sorted(expanded, key=lambda x: start_by_id.get(x, 10**18))
 
-    # ---- arestas de exceção (para excluir do CFG normal) ----
     exc_edges = set()
     for tr in try_regions:
         for p in tr.get("protected_blocks") or []:
             for h in tr.get("handler_blocks") or []:
                 exc_edges.add((p, h))
 
-    # CFG "normal" = sem arestas de exceção
     succ_norm = {}
     for s in all_nodes:
         nd = set()
@@ -191,7 +193,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
         for d in dsts:
             pred_norm[d].add(s)
 
-    # ---- dominadores / pós-dominadores no CFG normal ----
     def compute_dominators():
         if entry is None:
             return {}
@@ -264,7 +265,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                 return c
         return cands[0] if cands else None
 
-    # ---- detecta "print('Finalizado')" via stack_info ----
     def is_print_finalizado(bid: int) -> bool:
         bstmts = si_block_statements(stack_info, bid)
         for st in bstmts:
@@ -294,7 +294,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             instrs = b.get("instructions") or []
             stmts = block_stmts.get(b["id"], [])
 
-            # Procura nos statements por chamadas a __build_class__
             for st in stmts:
                 if not (isinstance(st, Stmt) and st.kind == "assign"
                         and isinstance(st.expr, Expr)
@@ -313,7 +312,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                 if not isinstance(class_name, str):
                     continue
 
-                # Extrai bases: args[0]=__build_class__, args[1]=make_function, args[2]=name, args[3:]=bases
                 bases = []
                 if len(call_expr.args) > 3:
                     bases = list(call_expr.args[3:])
@@ -326,7 +324,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                     "decorators": [],
                 })
 
-            # Detecta decoradores de classe (calls aninhados que envolvem o nome da classe)
             class_names = {cd["name"] for cd in class_defs if cd["block"] == b["id"]}
             for st in stmts:
                 if not (isinstance(st, Stmt) and st.kind == "assign"
@@ -348,7 +345,19 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
 
         return class_defs
 
-    # ---- basic blocks nodes ----
+    def _last_jump_target(b):
+        for ins in reversed(b.get("instructions") or []):
+            jt = ins.get("jump_target")
+            if jt is not None:
+                return jt
+        return None
+
+    def _op_argreprs(b):
+        out = []
+        for ins in (b.get("instructions") or []):
+            out.append((ins.get("opname"), ins.get("argrepr")))
+        return out
+
     basic = [
         node(
             "BasicBlock",
@@ -356,6 +365,9 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             start=b["start_offset"],
             end=b["end_offset"],
             opnames=[ins["opname"] for ins in (b.get("instructions") or [])],
+            op_argreprs=_op_argreprs(b),
+            loop_after=b.get("loop_after"),
+            last_jump_target=_last_jump_target(b),
         )
         for b in blocks_sorted
     ]
@@ -364,21 +376,49 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
     class_defs = detect_class_defs(blocks_sorted, stack_info)
     structures.extend(class_defs)
 
-
-    # ---- TRY/EXCEPT/FINALLY (recuperação real) ----
-    # Identifica blocos que pertencem a handlers de with (para excluí-los do try/except)
     with_handler_blocks = set(patterns.get("with_handler_blocks") or set())
     for wr in (patterns.get("with_regions") or []):
         hb = wr.get("handler_block")
         if hb is not None:
             with_handler_blocks.add(hb)
 
-    # Agrupa exception entries por range protegido
     range_groups = {}
     for r in try_regions:
         rng = r.get("range")
         if rng:
             range_groups.setdefault(rng, []).append(r)
+
+    by_handler = {}
+    for rng, regs in range_groups.items():
+        for r in regs:
+            h = r.get("handler_entry")
+            if h is None:
+                continue
+            by_handler.setdefault(h, []).append((rng, r))
+    merged_groups = {}
+    consumed_rngs = set()
+    for h, items in by_handler.items():
+        rngs_for_h = {it[0] for it in items}
+        if len(rngs_for_h) <= 1:
+            continue
+        min_start = min(rr[0] for rr in rngs_for_h)
+        max_end = max(rr[1] for rr in rngs_for_h)
+        new_rng = (min_start, max_end)
+        merged_regions = []
+        union_prot = set()
+        for rng, r in items:
+            merged_regions.append(r)
+            union_prot.update(r.get("protected_blocks", []))
+            consumed_rngs.add(rng)
+        synthetic = dict(merged_regions[0])
+        synthetic["range"] = new_rng
+        synthetic["protected_blocks"] = sorted(
+            union_prot, key=lambda x: start_by_id.get(x, 10**18)
+        )
+        merged_groups[new_rng] = [synthetic]
+    for rng in consumed_rngs:
+        range_groups.pop(rng, None)
+    range_groups.update(merged_groups)
 
     processed_try_ranges = set()
     for rng, regions in sorted(range_groups.items()):
@@ -401,7 +441,7 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             if handler_entry is None:
                 continue
             if handler_entry in with_handler_blocks:
-                continue  # handler de with, não de try/except
+                continue  
 
             h_block = blocks_by_id.get(handler_entry, {})
             h_instrs = h_block.get("instructions", []) or []
@@ -412,14 +452,12 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             has_with_exc_start = "WITH_EXCEPT_START" in h_opnames
 
             if has_with_exc_start:
-                continue  # handler de with
+                continue 
 
             if has_push_exc or has_check_exc:
-                # Segue cadeia de CHECK_EXC_MATCH para detectar multi-handler
-                check_chain = []  # [(check_block_id, exc_type, exc_var, jump_target_block)]
+                check_chain = [] 
 
                 def _extract_check_info(bid):
-                    """Extrai exc_type, exc_var e jump_target de um bloco com CHECK_EXC_MATCH."""
                     blk = blocks_by_id.get(bid, {})
                     ins = blk.get("instructions", []) or []
                     et = None
@@ -428,13 +466,28 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                         if i["opname"] == "CHECK_EXC_MATCH":
                             if idx > 0:
                                 prev = ins[idx - 1]
-                                if prev["opname"] in ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_ATTR"):
+                                if prev["opname"] == "BUILD_TUPLE":
+                                    n = int(prev.get("arg") or prev.get("argval") or 0)
+                                    loads = []
+                                    j = idx - 2
+                                    while j >= 0 and len(loads) < n:
+                                        p = ins[j]
+                                        if p["opname"] in ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_ATTR", "LOAD_FAST"):
+                                            loads.append(p.get("argval"))
+                                        elif p["opname"] in ("PUSH_NULL", "NOP"):
+                                            pass
+                                        else:
+                                            break
+                                        j -= 1
+                                    if len(loads) == n and n > 0:
+                                        loads.reverse()
+                                        et = "(" + ", ".join(str(x) for x in loads) + ")"
+                                elif prev["opname"] in ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_ATTR"):
                                     et = prev.get("argval")
                         if i["opname"].startswith("POP_JUMP_IF_"):
                             jt_off = i.get("jump_target")
                             if jt_off is not None:
                                 jt_block = offset_to_block.get(jt_off)
-                    # exc_var está no bloco fall-through (sucessor que não é o jump target)
                     ev = None
                     fall_bid = None
                     for s in succ_all.get(bid, set()):
@@ -447,7 +500,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                                 break
                     return et, ev, jt_block, fall_bid
 
-                # Começa no handler_entry (que tem PUSH_EXC_INFO + CHECK_EXC_MATCH)
                 current_check = handler_entry
                 while current_check is not None:
                     cb = blocks_by_id.get(current_check, {})
@@ -457,7 +509,6 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                         break
                     et, ev, jt_block, fall_bid = _extract_check_info(current_check)
                     check_chain.append((current_check, et, ev, jt_block, fall_bid))
-                    # Próximo na cadeia: o jump target do POP_JUMP_IF_FALSE
                     if jt_block is not None:
                         nb = blocks_by_id.get(jt_block, {})
                         ni = nb.get("instructions", []) or []
@@ -470,22 +521,21 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                         break
 
                 if check_chain:
-                    # Cria um handler para cada CHECK_EXC_MATCH na cadeia
                     all_check_blocks = {c[0] for c in check_chain}
                     all_jump_targets = {c[3] for c in check_chain if c[3] is not None}
                     stop = set(try_blocks) | all_check_blocks | all_jump_targets
 
                     for i, (chk_bid, et, ev, jt_bid, fall_bid) in enumerate(check_chain):
-                        # Walk do handler body a partir do fall-through
                         body_start = fall_bid if fall_bid else chk_bid
                         # Stop set: try blocks + outros check blocks + próximo jump target
                         h_stop = set(try_blocks)
                         for j, (other_chk, _, _, other_jt, _) in enumerate(check_chain):
                             if j != i:
-                                h_stop.add(other_chk)
-                                if other_jt is not None:
+                                if other_chk != chk_bid:
+                                    h_stop.add(other_chk)
+                                if other_jt is not None and other_jt != chk_bid and other_jt != body_start:
                                     h_stop.add(other_jt)
-                        if jt_bid is not None:
+                        if jt_bid is not None and jt_bid != chk_bid and jt_bid != body_start:
                             h_stop.add(jt_bid)
 
                         handler_blocks = walk_region(
@@ -520,24 +570,30 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                             "exc_var": ev,
                         })
                 else:
-                    # Fallback: handler sem CHECK_EXC_MATCH chain (bare except)
-                    min_off = start_by_id.get(handler_entry, None)
-                    stop = set(try_blocks)
-                    handler_blocks = walk_region(
-                        handler_entry,
-                        all_nodes, start_by_id, succ_norm, succ_all, blocks_by_id,
-                        stop_set=stop,
-                        use_norm=False,
-                        min_start_off=min_off,
-                    )
-                    handler_blocks = sorted(set(handler_blocks), key=lambda x: start_by_id.get(x, 10**18))
+                    # Fallback: handler sem CHECK_EXC_MATCH chain.
+                    # Se é um finally-exception-handler (PUSH_EXC_INFO + código + RERAISE,
+                    # sem CHECK_EXC_MATCH/POP_EXCEPT), trata como finally, não bare except.
+                    if is_finally_exc_handler(handler_entry, blocks_by_id, succ_all):
+                        if finally_handler_entry is None:
+                            finally_handler_entry = handler_entry
+                    else:
+                        min_off = start_by_id.get(handler_entry, None)
+                        stop = set(try_blocks)
+                        handler_blocks = walk_region(
+                            handler_entry,
+                            all_nodes, start_by_id, succ_norm, succ_all, blocks_by_id,
+                            stop_set=stop,
+                            use_norm=False,
+                            min_start_off=min_off,
+                        )
+                        handler_blocks = sorted(set(handler_blocks), key=lambda x: start_by_id.get(x, 10**18))
 
-                    handlers.append({
-                        "handler_entry": handler_entry,
-                        "handler_blocks": handler_blocks,
-                        "exc_type": None,
-                        "exc_var": None,
-                    })
+                        handlers.append({
+                            "handler_entry": handler_entry,
+                            "handler_blocks": handler_blocks,
+                            "exc_type": None,
+                            "exc_var": None,
+                        })
             else:
                 # Handler de finally/cleanup (sem CHECK_EXC_MATCH)
                 if finally_handler_entry is None:
@@ -593,6 +649,16 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                             break
                         outer_done = True
                         break
+
+        # Pure try/finally: handler é finally_exc_handler e não há except.
+        # Nesse caso o inline finally começa em rng[1] (fall-through do try body).
+        if (finally_inline_start_bid is None
+                and finally_handler_entry is not None
+                and not handlers):
+            inline_start_bid = offset_to_block.get(try_end_off)
+            if inline_start_bid is not None:
+                finally_inline_start_bid = inline_start_bid
+                finally_exc_handler_entry2 = finally_handler_entry
 
         # Determina blocos de finally
         _infra_fin = {"PUSH_EXC_INFO", "RERAISE", "COPY", "POP_EXCEPT", "NOP",
@@ -688,6 +754,23 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                                      and last_st.expr.value is None)):
                         post_finally_stmts.append(last_st)
 
+            # Deduplicação: em try/finally puro, todas as saídas do inline-finally
+            # fazem RETURN_VALUE do mesmo valor computado no try body.
+            # Remove post_finally_stmts semanticamente duplicados.
+            if post_finally_stmts:
+                deduped = []
+                seen_exprs = []
+                for st in post_finally_stmts:
+                    if not (isinstance(st, Stmt) and st.kind == "return"):
+                        deduped.append(st)
+                        continue
+                    key = _expr_signature(st.expr)
+                    if key in seen_exprs:
+                        continue
+                    seen_exprs.append(key)
+                    deduped.append(st)
+                post_finally_stmts = deduped
+
             if debug:
                 print(f"[DEBUG] Finally inline: start={finally_inline_start_bid} "
                       f"blocks={finally_blocks} cont={finally_continuation_bids} "
@@ -768,7 +851,33 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                     return True  # tem opcode real (STORE, BINARY_OP, CALL, etc.)
             return False
 
-        if not _else_has_real_code(else_blocks):
+        if else_blocks and not _else_has_real_code(else_blocks):
+            # Bloco pós-try sem código real: pode ser (a) o RETURN_VALUE que consome
+            # a pilha deixada pelo try body (ex: `try: return int(text)`) — a
+            # exception table 3.12 só protege a CALL, deixando o RETURN fora do
+            # range mas ele é o tail idiomático do try body; ou (b) a cópia
+            # duplicada de um `return local` que na fonte estava APÓS o try/except
+            # (ex: try_simple: `return result` idêntico no tail do try e do except).
+            # Distinguimos pelo primeiro opcode do bloco candidato: se for
+            # RETURN_VALUE puro (sem LOAD anterior), consome pilha do try → mover
+            # para dentro do try. Se começar com LOAD_* (carrega local fresco),
+            # é o tail pós-try duplicado → manter fora.
+            moveable = []
+            for _eb in else_blocks:
+                _einstrs = blocks_by_id.get(_eb, {}).get("instructions", []) or []
+                _einstrs = [i for i in _einstrs if i["opname"] not in ("NOP",)]
+                if not _einstrs:
+                    continue
+                first_op = _einstrs[0]["opname"]
+                preds = pred_norm.get(_eb, set())
+                only_try_pred = bool(preds) and all(p in try_blocks_set for p in preds)
+                if first_op in ("RETURN_VALUE",) and only_try_pred:
+                    moveable.append(_eb)
+            if moveable:
+                try_blocks_set.update(moveable)
+                try_blocks = sorted(
+                    try_blocks_set, key=lambda x: start_by_id.get(x, 10**18)
+                )
             else_blocks = []
 
         join_after_try = immediate_postdom(try_blocks[-1]) if try_blocks else None
@@ -894,8 +1003,25 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                                     work.append(s)
                     body_blocks.sort(key=lambda x: start_by_id.get(x, 10**18))
 
+                # Detecta `except ExcType as <var>` pattern do MicroPython:
+                # o primeiro bloco do body começa com STORE_FAST_MULTI/STORE_FAST_N <var>
+                # (binding da exceção), seguido por SETUP_FINALLY cujo cleanup é o padrão
+                # exc_var_cleanup (LOAD_CONST_NONE + STORE_FAST <var> + DELETE_FAST <var>).
+                exc_var = None
+                if body_blocks:
+                    first_body = blocks_by_id.get(body_blocks[0], {})
+                    fb_instrs = first_body.get("instructions", []) or []
+                    if fb_instrs and fb_instrs[0].get("opname") in ("STORE_FAST_MULTI", "STORE_FAST_N"):
+                        has_setup_finally = any(
+                            i.get("opname") == "SETUP_FINALLY" for i in fb_instrs
+                        )
+                        if has_setup_finally:
+                            exc_var = (fb_instrs[0].get("argrepr")
+                                       or str(fb_instrs[0].get("argval", "")))
+
                 handlers_out.append({
                     "exc_type":      exc_type,
+                    "exc_var":       exc_var,
                     "handler_blocks": [current_bid] + body_blocks,
                     "handler_entry": current_bid,
                 })
@@ -978,6 +1104,10 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                 hb_pre = h_info_pre.get("handler_block")
                 if hb_pre is None:
                     continue
+                # Plumbing de `except ExcType as <var>` — o SETUP_FINALLY que limpa
+                # a binding da exceção é ruído do compilador, não uma região real.
+                if h_info_pre.get("is_exc_var_cleanup"):
+                    continue
                 p_pre = frozenset(mpy_region_pre.get("protected_blocks", []))
                 if h_info_pre.get("is_cleanup"):
                     _cleanup_list.append((p_pre, hb_pre, mpy_region_pre))
@@ -1043,6 +1173,10 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                 if hb is None:
                     continue
 
+                # Plumbing de `except ExcType as <var>` — suprime completamente.
+                if h_info.get("is_exc_var_cleanup"):
+                    continue
+
                 is_except  = h_info.get("is_except", False)
                 is_cleanup = h_info.get("is_cleanup", False)
 
@@ -1088,6 +1222,68 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                                         and st.expr.value is None):
                                     post_stmts.append(st)
 
+                    # Detecta `else:` — target do POP_EXCEPT_JUMP do último protected
+                    # que não é alcançado por nenhum handler. Executa no caminho sem
+                    # exceção, separando da continuação comum (#M20).
+                    else_blocks_m = []
+                    if protected:
+                        last_prot_bid = max(
+                            protected, key=lambda _b: start_by_id.get(_b, 0)
+                        )
+                        last_prot_instrs = (
+                            blocks_by_id.get(last_prot_bid, {}).get("instructions", []) or []
+                        )
+                        if last_prot_instrs and last_prot_instrs[-1].get("opname") == "POP_EXCEPT_JUMP":
+                            else_off = last_prot_instrs[-1].get("jump_target")
+                            else_entry = offset_to_block.get(else_off) if else_off is not None else None
+                            excluded_m = (
+                                set(protected) | all_handler_bids | set(exc_infra_bids)
+                            )
+                            if (else_entry is not None
+                                    and else_entry not in excluded_m):
+                                # Verifica que nenhum handler alcança else_entry via CFG
+                                # — exclui infra (END_FINALLY, POP_EXCEPT_JUMP) do walk:
+                                # seus sucessores no CFG estático representam rethrow/cleanup,
+                                # não fluxo do handler do usuário.
+                                infra_set = set(exc_infra_bids)
+                                handler_reach = set()
+                                hwork = list(all_handler_bids)
+                                while hwork:
+                                    hx = hwork.pop()
+                                    if hx in handler_reach:
+                                        continue
+                                    handler_reach.add(hx)
+                                    if hx in infra_set:
+                                        continue
+                                    for sx in succ_all.get(hx, set()):
+                                        if sx in infra_set:
+                                            continue
+                                        if sx not in handler_reach:
+                                            hwork.append(sx)
+                                if else_entry not in handler_reach:
+                                    # Coleta blocos do else: reachable de else_entry
+                                    # excluindo protected/handler/infra e sem voltar
+                                    # para blocos iniciados por SETUP_* de outras regiões
+                                    else_reach = set()
+                                    ework = [else_entry]
+                                    while ework:
+                                        eb = ework.pop()
+                                        if eb in else_reach or eb in excluded_m:
+                                            continue
+                                        eb_instrs = (
+                                            blocks_by_id.get(eb, {}).get("instructions", []) or []
+                                        )
+                                        eb_ops = {ins.get("opname") for ins in eb_instrs}
+                                        if eb != else_entry and (eb_ops & {"SETUP_EXCEPT", "SETUP_FINALLY", "SETUP_WITH"}):
+                                            continue
+                                        else_reach.add(eb)
+                                        for sx in succ_all.get(eb, set()):
+                                            if sx not in excluded_m and sx not in else_reach:
+                                                ework.append(sx)
+                                    else_blocks_m = sorted(
+                                        else_reach, key=lambda x: start_by_id.get(x, 10**18)
+                                    )
+
                     structures.append(node(
                         "TryExceptFinally",
                         try_blocks=protected,
@@ -1096,7 +1292,7 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                         finally_continuation_bids=[],
                         finally_exc_handler_bids=exc_infra_bids,
                         post_finally_stmts=post_stmts,
-                        else_blocks=[],
+                        else_blocks=else_blocks_m,
                         join_block=None,
                         except_type=handlers_list[0].get("exc_type") if handlers_list else None,
                         except_var=None,
@@ -1231,9 +1427,14 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
         else_blocks = collect_branch(f_succ, join, cond_off)
 
         if join is not None and is_terminal_block(join):
-            if t_succ == join and not then_blocks:
+            # Só duplicar o join para um branch se o OUTRO branch termina dentro
+            # (return/raise/break). Se ambos caem naturalmente no join, ele é
+            # continuação comum e deve ficar fora do if.
+            then_terminates = bool(then_blocks) and is_terminal_block(then_blocks[-1])
+            else_terminates = bool(else_blocks) and is_terminal_block(else_blocks[-1])
+            if t_succ == join and not then_blocks and else_terminates:
                 then_blocks = [join]
-            if f_succ == join and not else_blocks:
+            if f_succ == join and not else_blocks and then_terminates:
                 else_blocks = [join]
 
         then_set = set(then_blocks) - {cond}
@@ -1505,6 +1706,7 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             elem_pats = {}  # índice → ("const", valor) ou ("bind", nome)
 
             # Percorre blocos intermediários (não start, não length-check) para condições de elementos
+            guard_exprs_smc = []
             for bid_smc in sorted(c_all):
                 if bid_smc == c_start:
                     continue
@@ -1514,21 +1716,32 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                 ops_smc = [i["opname"] for i in (b_smc.get("instructions") or [])]
                 if "GET_LEN" in ops_smc:
                     continue  # Pula bloco de verificação de comprimento
+                # Extrai bindings STORE_FAST(unpack(i)) deste bloco
+                for st_smc in smc_block_stmts.get(bid_smc, []):
+                    if (isinstance(st_smc, Stmt) and st_smc.kind == "assign"
+                            and isinstance(st_smc.expr, Expr) and st_smc.expr.kind == "unpack"):
+                        idx_smc = st_smc.expr.value
+                        if idx_smc not in elem_pats:
+                            elem_pats[idx_smc] = ("bind", st_smc.target)
+                # Classifica condições: "elem == const" → padrão; restante → guard
                 conds_smc = smc_block_conds.get(bid_smc, [])
                 for cond_smc in conds_smc:
-                    if not (isinstance(cond_smc, Expr) and cond_smc.kind == "compare"
+                    if (isinstance(cond_smc, Expr) and cond_smc.kind == "compare"
                             and cond_smc.value == "=="):
-                        continue
-                    a_smc = cond_smc.args[0] if cond_smc.args else None
-                    b_smc_val = cond_smc.args[1] if len(cond_smc.args) > 1 else None
-                    if (isinstance(a_smc, Expr) and a_smc.kind == "unpack"
-                            and isinstance(b_smc_val, Expr) and b_smc_val.kind == "const"):
-                        elem_pats[a_smc.value] = ("const", b_smc_val.value)
-                    elif (isinstance(b_smc_val, Expr) and b_smc_val.kind == "unpack"
-                            and isinstance(a_smc, Expr) and a_smc.kind == "const"):
-                        elem_pats[b_smc_val.value] = ("const", a_smc.value)
+                        a_smc = cond_smc.args[0] if cond_smc.args else None
+                        b_smc_val = cond_smc.args[1] if len(cond_smc.args) > 1 else None
+                        if (isinstance(a_smc, Expr) and a_smc.kind == "unpack"
+                                and isinstance(b_smc_val, Expr) and b_smc_val.kind == "const"):
+                            elem_pats[a_smc.value] = ("const", b_smc_val.value)
+                            continue
+                        if (isinstance(b_smc_val, Expr) and b_smc_val.kind == "unpack"
+                                and isinstance(a_smc, Expr) and a_smc.kind == "const"):
+                            elem_pats[b_smc_val.value] = ("const", a_smc.value)
+                            continue
+                    # Tudo que não é constraint de elemento é guard
+                    guard_exprs_smc.append(cond_smc)
 
-            # Bindings do bloco corpo (STORE_FAST no início)
+            # Bindings adicionais do bloco corpo (STORE_FAST no início)
             n_bindings_smc = 0
             body_stmts_smc = list(smc_block_stmts.get(c_body, []))
             for st_smc in body_stmts_smc:
@@ -1557,6 +1770,10 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
             else:
                 pat_str_smc = "_"
 
+            if guard_exprs_smc:
+                guard_txt = " and ".join(expr_repr(g) for g in guard_exprs_smc)
+                pat_str_smc = f"{pat_str_smc} if {guard_txt}"
+
             cases_with_pats.append({
                 "start_bid": c_start,
                 "body_bid": c_body,
@@ -1577,6 +1794,44 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
         ))
         if debug:
             print(f"[DEBUG] Seq match chain: start={smc_start_bid}, {len(cases_with_pats)} cases, default={smc_default_bid}")
+
+    # Caso 4: map_match_chains — padrões de mapping multi-bloco (#38)
+    map_match_chains = patterns.get("map_match_chains", [])
+    for mmc in map_match_chains:
+        mmc_start_bid = mmc["first_block"]
+        mmc_cases = mmc["cases"]
+        mmc_default_bid = mmc.get("default_block")
+        mmc_all_bids = mmc.get("all_blocks", set())
+
+        mmc_in_stk = si_in_stack(stack_info, mmc_start_bid)
+        mmc_subject = None
+        if mmc_in_stk:
+            mmc_subject = mmc_in_stk[-1]
+        else:
+            first_b_mmc = blocks_by_id.get(mmc_start_bid)
+            if first_b_mmc:
+                for ins_mmc in (first_b_mmc.get("instructions") or []):
+                    on_mmc = ins_mmc["opname"]
+                    if on_mmc in ("COPY", "MATCH_MAPPING"):
+                        break
+                    if on_mmc == "LOAD_FAST":
+                        mmc_subject = Expr(kind="name", value=ins_mmc.get("argval", "?"),
+                                           origins=frozenset())
+                    elif on_mmc in ("LOAD_GLOBAL", "LOAD_NAME"):
+                        mmc_subject = Expr(kind="global_name", value=ins_mmc.get("argval", "?"),
+                                           origins=frozenset())
+
+        structures.append(node(
+            "Match",
+            subject_expr=mmc_subject,
+            cases=mmc_cases,
+            first_block=mmc_start_bid,
+            default_block=mmc_default_bid,
+            all_blocks=mmc_all_bids,
+            is_seq_chain=True,  # reusa renderização (pattern_str + n_bindings)
+        ))
+        if debug:
+            print(f"[DEBUG] Map match chain: start={mmc_start_bid}, {len(mmc_cases)} cases, default={mmc_default_bid}")
 
     # ---- GLOBAL / NONLOCAL INFERENCE ----
     if code_obj.co_name != "<module>":
@@ -1636,7 +1891,9 @@ def build_recovered_ast(blocks, cfg, stack_info, patterns, code_obj, debug=True)
                     break
 
                 if decos and st.target:
-                    decos.reverse()  # outermost first
+                    # A traversal acima coleta do call mais externo para o mais interno,
+                    # que já é a ordem que Python espera (outer @ primeiro, inner @ mais
+                    # próximo do def). Não aplicar reverse aqui.
                     func_decorators.setdefault(st.target, []).append(decos)
 
         return func_decorators
