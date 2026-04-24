@@ -40,6 +40,7 @@ from NativeDisasm.base import format_hex_dump
 
 _MAX_RECENT = 10
 
+
 _TYPE_PREFIX = {
     "class":    "\u25C6 ",   # ◆
     "function": "\u0192 ",   # ƒ
@@ -67,7 +68,6 @@ def _detect_format(path: str) -> str:
 
 
 class SearchBar(QWidget):
-
 
     def __init__(self, target: QPlainTextEdit, parent=None):
         super().__init__(parent)
@@ -202,9 +202,6 @@ class SearchBar(QWidget):
             self._target.ensureCursorVisible()
 
 
-# ------------------------------------------------------------------
-# Janela principal
-# ------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
 
@@ -212,8 +209,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setAcceptDrops(True)
-
-        # --- dados ---
         self.bytecode_meta: dict = {}
         self._func_meta: dict    = {}
         self._addr_items: list   = []
@@ -227,42 +222,31 @@ class MainWindow(QMainWindow):
         self._bytecode_full: str = ""
         self._annotations: dict = {"renames": {}, "renames_local": {}, "comments_bc": {}, "comments_rc": {}}
         self._settings = QSettings("PythonDecompiler", "PythonDecompiler")
-
-        # Edição inline de comentários
         self._comment_editing: bool = False
         self._comment_edit_target: QPlainTextEdit | None = None
         self._comment_edit_line: int = -1
         self._comment_edit_original: str = ""
         self._comment_edit_panel: str = ""
-
-        # Navegação bidirecional
         self._sync_nav: bool = True
         self._sync_guard: bool = False
         self._bc_line_to_func: dict[int, str] = {}
         self._rc_line_to_func: dict[int, str] = {}
         self._last_synced_rc_func: str = ""
-
-        # Sessões (múltiplas abas)
         self._sessions: dict[int, dict] = {}
         self._next_sid: int = 0
         self._active_sid: int = -1
-
         self._build_ui()
         self._build_menus()
         self._setup_statusbar()
         self._show_splash()
 
-    # ------------------------------------------------------------------
-    # Construção da UI
-    # ------------------------------------------------------------------
+
 
     def _build_ui(self):
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
-        self._stack.addWidget(self._build_splash())  # página 0
-        self._stack.addWidget(self._build_main())    # página 1
-
-        # Overlay de drag-and-drop
+        self._stack.addWidget(self._build_splash())  
+        self._stack.addWidget(self._build_main())    
         self._drop_overlay = QLabel("Solte o arquivo aqui", self)
         self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         font = self._drop_overlay.font()
@@ -314,8 +298,6 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(page)
         root.setContentsMargins(GUTTER, GUTTER, GUTTER, GUTTER)
         root.setSpacing(GUTTER)
-
-        # ---- Topbar ----
         topbar = QWidget()
         hbox = QHBoxLayout(topbar)
         hbox.setContentsMargins(0, 0, 0, 0)
@@ -337,7 +319,6 @@ class MainWindow(QMainWindow):
         hbox.addWidget(self._btn_reload)
         hbox.addWidget(self._btn_close_tab)
 
-        # Tab bar
         self._tab_bar = QTabBar()
         self._tab_bar.setTabsClosable(True)
         self._tab_bar.setMovable(True)
@@ -354,7 +335,6 @@ class MainWindow(QMainWindow):
         self._tab_bar_row.addWidget(self._tab_bar, 0)
         self._tab_bar_row.addStretch(1)
 
-        # ---- Splitter horizontal (3 painéis) ----
         _splitter_css = """
             QSplitter::handle {
                 background-color: palette(mid);
@@ -377,7 +357,6 @@ class MainWindow(QMainWindow):
         h_splitter.setStyleSheet(_splitter_css)
         h_splitter.setChildrenCollapsible(False)
 
-        # Painel esquerdo — listas (layout original)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -390,7 +369,6 @@ class MainWindow(QMainWindow):
         self._list_addrs   = QListWidget()
         self._list_bookmarks = QListWidget()
 
-        # Widgets extras (Fase 4) — não visíveis no painel, acessíveis via código
         self._tree_handlers = QTreeWidget()
         self._tree_handlers.setHeaderHidden(True)
         self._list_comments = QListWidget()
@@ -415,7 +393,6 @@ class MainWindow(QMainWindow):
         self._list_comments.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list_comments.customContextMenuRequested.connect(self._comments_context_menu)
 
-        # Painel central — Bytecode (com SearchBar)
         mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
 
         self._byte_text = QPlainTextEdit()
@@ -434,7 +411,6 @@ class MainWindow(QMainWindow):
         byte_lay.addWidget(self._byte_search)
         byte_lay.addWidget(self._byte_text)
 
-        # Painel direito — Código recuperado (com SearchBar)
         self._rec_text = QPlainTextEdit()
         self._rec_text.setReadOnly(True)
         self._rec_text.setFont(mono)
@@ -459,7 +435,6 @@ class MainWindow(QMainWindow):
         h_splitter.setStretchFactor(1, 1)
         h_splitter.setStretchFactor(2, 1)
 
-        # ---- Painel inferior — Hex Dump (esquerda) + Comentários (direita) ----
         self._hex_text = QPlainTextEdit()
         self._hex_text.setReadOnly(True)
         self._hex_text.setFont(mono)
@@ -469,7 +444,6 @@ class MainWindow(QMainWindow):
 
         comments_group = self._make_group("Comentários", self._list_comments)
 
-        # Console Python
         self._console = PythonConsole()
         console_group = self._make_group("Console Python", self._console)
         console_group.setVisible(False)
@@ -487,7 +461,6 @@ class MainWindow(QMainWindow):
         bottom_splitter.setStretchFactor(1, 0)
         bottom_splitter.setStretchFactor(2, 0)
 
-        # ---- Splitter vertical ----
         v_splitter = QSplitter(Qt.Orientation.Vertical)
         v_splitter.setHandleWidth(5)
         v_splitter.setStyleSheet(_splitter_css)
@@ -511,14 +484,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(widget)
         return box
 
-    # ------------------------------------------------------------------
-    # Barra de menus + atalhos
-    # ------------------------------------------------------------------
+
 
     def _build_menus(self):
         menubar = self.menuBar()
 
-        # --- Arquivo ---
         file_menu = menubar.addMenu("&Arquivo")
 
         act = file_menu.addAction("&Abrir...")
@@ -551,7 +521,6 @@ class MainWindow(QMainWindow):
         act.setShortcut(QKeySequence("Ctrl+Q"))
         act.triggered.connect(self.close)
 
-        # --- Editar ---
         edit_menu = menubar.addMenu("&Editar")
 
         act = edit_menu.addAction("&Buscar...")
@@ -570,7 +539,6 @@ class MainWindow(QMainWindow):
         act = edit_menu.addAction("&Comentar (;)")
         act.triggered.connect(self._start_inline_comment)
 
-        # --- Visualizar ---
         view_menu = menubar.addMenu("&Visualizar")
 
         self._act_hex = view_menu.addAction("Painel &Hex Dump")
@@ -598,7 +566,6 @@ class MainWindow(QMainWindow):
         self._act_console.setShortcut(QKeySequence("F12"))
         self._act_console.triggered.connect(self._toggle_console)
 
-        # --- Ajuda ---
         help_menu = menubar.addMenu("Aj&uda")
         act = help_menu.addAction("&Sobre")
         act.triggered.connect(self._show_about)
@@ -651,9 +618,6 @@ class MainWindow(QMainWindow):
             "</table>",
         )
 
-    # ------------------------------------------------------------------
-    # Status bar
-    # ------------------------------------------------------------------
 
     def _setup_statusbar(self):
         self._status_file  = QLabel("")
@@ -683,9 +647,6 @@ class MainWindow(QMainWindow):
         elapsed = time.perf_counter() - self._load_start
         self._status_time.setText(f"Recuperado em {elapsed:.2f}s  ")
 
-    # ------------------------------------------------------------------
-    # Drag-and-drop
-    # ------------------------------------------------------------------
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -716,9 +677,6 @@ class MainWindow(QMainWindow):
                 return
         event.ignore()
 
-    # ------------------------------------------------------------------
-    # Navegação entre páginas
-    # ------------------------------------------------------------------
 
     def _show_splash(self):
         self._stack.setCurrentIndex(0)
@@ -728,9 +686,6 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
         self.resize(1400, 800)
 
-    # ------------------------------------------------------------------
-    # Ações
-    # ------------------------------------------------------------------
 
     def pick_and_load(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -755,7 +710,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Formato não suportado", str(exc))
             return
 
-        # Verifica se já está aberto em alguma aba
         for i in range(self._tab_bar.count()):
             sid = self._tab_bar.tabData(i)
             if self._sessions.get(sid, {}).get("path") == path:
@@ -768,12 +722,9 @@ class MainWindow(QMainWindow):
 
         runner = run_engine if fmt == "cpython" else run_mpy_engine
 
-        # Salva sessão atual antes de trocar — workers antigos continuam rodando
-        # em paralelo e entregam o resultado via sid no _on_engine_result.
         if self._active_sid >= 0:
             self._save_session(self._active_sid)
 
-        # Cria nova aba
         sid = self._next_sid
         self._next_sid += 1
         self._sessions[sid] = {"path": path}
@@ -803,9 +754,6 @@ class MainWindow(QMainWindow):
         self._add_to_recent(path)
 
     def _set_busy(self, busy: bool):
-        # Idempotente — evita empilhar override cursors quando há múltiplos
-        # workers ativos (cada aba tem o seu) e só o da aba ativa controla
-        # este estado.
         if busy and not self._is_busy:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self._is_busy = True
@@ -816,14 +764,9 @@ class MainWindow(QMainWindow):
             btn.setEnabled(not busy)
 
     def _on_engine_result(self, sid: int, byte_txt: str, rec_txt: str, meta: dict):
-        # Só libera o estado "busy" se o resultado é da aba ativa — caso
-        # contrário a aba ativa ainda está carregando e não queremos habilitar
-        # os botões prematuramente.
         if sid == self._active_sid:
             self._set_busy(False)
 
-        # Se o resultado é para uma aba que não é mais a ativa (race condition),
-        # salva direto no dict da sessão e não mexe nos widgets.
         if sid != self._active_sid:
             s = self._sessions.get(sid)
             if s is not None:
@@ -834,7 +777,6 @@ class MainWindow(QMainWindow):
                 s["recovered_funcs"] = split_recovered_functions(rec_txt)
                 s["byte_txt"] = byte_txt
                 s["rec_txt"] = rec_txt
-                # Carrega annotations do arquivo (não zerar — o usuário pode ter dados)
                 path = s.get("path", "")
                 s["annotations"] = load_annotations(path) if path else {
                     "renames": {}, "renames_local": {}, "comments_bc": {}, "comments_rc": {}}
@@ -871,7 +813,6 @@ class MainWindow(QMainWindow):
         self._load_bookmarks()
         self._load_annotations()
 
-        # Seta o texto com renomeações e comentários inline
         self._byte_text.setPlainText(
             self._prepare_display_text(byte_txt, "comments_bc"))
         self._rec_text.setPlainText(
@@ -879,7 +820,6 @@ class MainWindow(QMainWindow):
         self._render_comment_highlights()
         self._refresh_comments_list()
 
-        # Atualiza namespace do console
         self._console.set_namespace({
             "app": self, "bytecode": byte_txt,
             "recovered": rec_txt, "meta": meta,
@@ -889,7 +829,6 @@ class MainWindow(QMainWindow):
         if sid == self._active_sid:
             self._set_busy(False)
 
-        # Identifica a aba que falhou pelo sid (pode não ser a ativa)
         target_sid = sid if sid >= 0 else self._active_sid
         if target_sid >= 0:
             for i in range(self._tab_bar.count()):
@@ -912,12 +851,8 @@ class MainWindow(QMainWindow):
             f"Falha ao processar o bytecode.\n\n{SUPPORTED_HINT}\n\n{msg}",
         )
 
-    # ------------------------------------------------------------------
-    # População das listas e árvore
-    # ------------------------------------------------------------------
 
     def _populate_lists(self):
-        # Constantes (categorizada)
         self._tree_consts.clear()
         bc_text = self._byte_text.toPlainText()
         cats = parse_all_constants(bc_text)
@@ -935,7 +870,6 @@ class MainWindow(QMainWindow):
                 child.setData(0, Qt.ItemDataRole.UserRole, v)
         self._tree_consts.expandAll()
 
-        # Árvore hierárquica de code objects
         self._tree_funcs.clear()
         self._view_all_item = QTreeWidgetItem(self._tree_funcs, ["\u2039View All\u203a"])
         self._view_all_item.setData(0, Qt.ItemDataRole.UserRole, "__view_all__")
@@ -944,7 +878,6 @@ class MainWindow(QMainWindow):
         if hierarchy and hierarchy.get("children"):
             self._build_tree_from_hierarchy(self._tree_funcs, hierarchy.get("children", []))
         else:
-            # Fallback: lista flat
             for name in sorted(self._recovered_funcs.keys()):
                 item = QTreeWidgetItem(self._tree_funcs, [f"\u0192 {name}"])
                 item.setData(0, Qt.ItemDataRole.UserRole, name)
@@ -956,7 +889,6 @@ class MainWindow(QMainWindow):
         for addr, name in self._addr_items:
             self._list_addrs.addItem(f"{addr}  {name}")
 
-        # Exception handlers
         self._tree_handlers.clear()
         self._handlers = parse_exception_handlers(bc_text)
         _TYPE_ICONS = {"except": "E", "finally": "F", "with": "W"}
@@ -984,9 +916,6 @@ class MainWindow(QMainWindow):
             if child.get("children"):
                 self._build_tree_from_hierarchy(item, child["children"])
 
-    # ------------------------------------------------------------------
-    # Navegação nas listas
-    # ------------------------------------------------------------------
 
     def _on_const_select(self, current: QTreeWidgetItem | None, _prev):
         if current is None:
@@ -1023,8 +952,6 @@ class MainWindow(QMainWindow):
                 self._prepare_display_text(code, "comments_rc", func_name=name))
             self._sync_guard = False
         else:
-            # Code object sem código recuperado individual (lambda, genexpr...)
-            # Mostra tudo e tenta navegar ao bytecode
             self._sync_guard = True
             self._rec_text.setPlainText(
                 self._prepare_display_text(self._recovered_full, "comments_rc"))
@@ -1048,21 +975,16 @@ class MainWindow(QMainWindow):
             return
         self._scroll_to_in_bytecode(f"Disassembly of <code object {name} at {addr}")
 
-    # ------------------------------------------------------------------
-    # Navegação bidirecional (sync)
-    # ------------------------------------------------------------------
 
     def _build_line_maps(self):
-        """Constrói mapeamento linha→função para ambos os painéis."""
         self._last_synced_rc_func = ""
-        # Bytecode: cada code object vai do seu header até o próximo
         self._bc_line_to_func = {}
         entries = []
         for _addr, name in self._addr_items:
             meta = self._func_meta.get(name, {})
             line = meta.get("line")
             if line is not None:
-                entries.append((line - 1, name))  # 0-based
+                entries.append((line - 1, name))  
         entries.sort()
         total_bc = self._bytecode_full.count("\n") + 1
         for i, (start, name) in enumerate(entries):
@@ -1070,7 +992,6 @@ class MainWindow(QMainWindow):
             for ln in range(start, end):
                 self._bc_line_to_func[ln] = name
 
-        # Recovered: cada função vai do início da sua def até a próxima
         self._rc_line_to_func = {}
         rc_entries = []
         for name, text in self._recovered_funcs.items():
@@ -1087,12 +1008,10 @@ class MainWindow(QMainWindow):
                 self._rc_line_to_func[ln] = name
 
     def _on_byte_cursor_moved(self):
-        """Quando o cursor se move no bytecode, destaca a função correspondente no código."""
         if self._sync_guard or not self._sync_nav:
             return
         line = self._byte_text.textCursor().blockNumber()
         self._show_comment_for_line("comments_bc", line)
-        # Limpa highlights de função antigos no bytecode (de sync rec→bc anterior)
         self._byte_text.setExtraSelections(
             self._comment_selections_for("comments_bc", self._byte_text))
         name = self._bc_line_to_func.get(line)
@@ -1104,12 +1023,10 @@ class MainWindow(QMainWindow):
         self._highlight_func_in_recovered(name)
 
     def _on_rec_cursor_moved(self):
-        """Quando o cursor se move no código, destaca a seção correspondente no bytecode."""
         if self._sync_guard or not self._sync_nav:
             return
         line = self._rec_text.textCursor().blockNumber()
         self._show_comment_for_line("comments_rc", line)
-        # Limpa highlights de função antigos no recovered (de sync bc→rec anterior)
         self._rec_text.setExtraSelections(
             self._comment_selections_for("comments_rc", self._rec_text))
         self._last_synced_rc_func = ""
@@ -1121,14 +1038,12 @@ class MainWindow(QMainWindow):
         self._highlight_func_in_bytecode(name)
 
     def _show_comment_for_line(self, panel: str, line: int):
-        """Exibe o comentário da linha na statusbar, se houver."""
         key = str(line + 1)
         comment = self._annotations.get(panel, {}).get(key)
         if comment:
             self.statusBar().showMessage(f"# {comment}", 5000)
 
     def _highlight_func_in_recovered(self, name: str):
-        """Destaca e navega até a função correspondente no painel de código."""
         text = self._recovered_funcs.get(name)
         if not text:
             return
@@ -1136,7 +1051,6 @@ class MainWindow(QMainWindow):
         if pos < 0:
             return
 
-        # Se não está em "View All", muda para "View All" para mostrar todas as funções
         current = self._tree_funcs.currentItem()
         if not current or current.data(0, Qt.ItemDataRole.UserRole) != "__view_all__":
             self._sync_guard = True
@@ -1175,7 +1089,6 @@ class MainWindow(QMainWindow):
                 self._sync_guard = False
 
     def _comment_selections_for(self, panel: str, text_edit) -> list:
-        """Retorna ExtraSelections de highlight verde para linhas com comentários."""
         comments = self._annotations.get(panel, {})
         if not comments:
             return []
@@ -1202,14 +1115,11 @@ class MainWindow(QMainWindow):
         return sels
 
     def _highlight_func_in_bytecode(self, name: str):
-        """Aplica highlight sutil na faixa do code object no bytecode."""
         meta = self._func_meta.get(name, {})
         start = meta.get("line")
         if start is None:
             return
-        start -= 1  # 0-based
-
-        # Acha o fim da seção (próximo header ou fim do texto)
+        start -= 1  
         entries = sorted(
             (m.get("line", 0) - 1 for n, m in self._func_meta.items() if m.get("line")),
         )
@@ -1238,9 +1148,6 @@ class MainWindow(QMainWindow):
             selections.append(sel)
         self._byte_text.setExtraSelections(selections)
 
-    # ------------------------------------------------------------------
-    # Helpers de scroll/highlight no painel de bytecode
-    # ------------------------------------------------------------------
 
     def _scroll_to_in_bytecode(self, needle: str):
         self._byte_text.setExtraSelections([])
@@ -1265,9 +1172,6 @@ class MainWindow(QMainWindow):
         self._byte_text.setTextCursor(cursor)
         self._byte_text.ensureCursorVisible()
 
-    # ------------------------------------------------------------------
-    # Exportar código recuperado (Save As)
-    # ------------------------------------------------------------------
 
     def _save_recovered(self):
         text = self._rec_text.toPlainText()
@@ -1284,9 +1188,6 @@ class MainWindow(QMainWindow):
             f.write(text)
         self.statusBar().showMessage(f"Salvo em {path}", 5000)
 
-    # ------------------------------------------------------------------
-    # Histórico de arquivos recentes
-    # ------------------------------------------------------------------
 
     def _add_to_recent(self, path: str):
         recent = self._settings.value("recent_files", [])
@@ -1321,9 +1222,6 @@ class MainWindow(QMainWindow):
         self._settings.setValue("recent_files", [])
         self._update_recent_menu()
 
-    # ------------------------------------------------------------------
-    # Bookmarks
-    # ------------------------------------------------------------------
 
     def _bm_key(self) -> str | None:
         path = self._path_input.text()
@@ -1350,9 +1248,6 @@ class MainWindow(QMainWindow):
         block_text = block.text() if block.isValid() else ""
         display_text = block_text[:60].strip() or "(linha vazia)"
 
-        # Para o painel de código recuperado, guarda também o nome do code
-        # object ativo na árvore — o número de linha é relativo à visão atual,
-        # então precisamos restaurar a mesma visão ao clicar no bookmark.
         func_ctx: str | None = None
         if panel == "recovered":
             current = self._tree_funcs.currentItem()
@@ -1380,7 +1275,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Bookmark adicionado.", 2000)
 
     def _find_tree_item_by_name(self, name: str) -> QTreeWidgetItem | None:
-        """Procura um item da árvore de code objects pelo nome (UserRole)."""
         def _walk(node: QTreeWidgetItem) -> QTreeWidgetItem | None:
             if node.data(0, Qt.ItemDataRole.UserRole) == name:
                 return node
@@ -1404,8 +1298,6 @@ class MainWindow(QMainWindow):
         bm = self._bookmarks[idx]
 
         if bm["panel"] == "recovered":
-            # Restaura a mesma visão (View All ou função específica) em que o
-            # bookmark foi criado — o número de linha é relativo a essa visão.
             target_name = bm.get("func") or "__view_all__"
             if target_name == "__view_all__":
                 target_item = self._view_all_item
@@ -1419,7 +1311,6 @@ class MainWindow(QMainWindow):
 
         expected_text = bm.get("block_text")
         block = target.document().findBlockByNumber(bm["line"])
-        # Fallback: se a linha não bate mais (texto mudou / shift), procura pelo conteúdo.
         if (not block.isValid()
                 or (expected_text is not None and block.text() != expected_text)):
             if expected_text:
@@ -1432,20 +1323,14 @@ class MainWindow(QMainWindow):
                 "Bookmark inválido — linha não encontrada.", 3000)
             return
 
-        # Cursor de navegação (sem seleção — senão o Qt pinta a seleção
-        # padrão cinza por cima do ExtraSelection).
         nav_cursor = QTextCursor(block)
         nav_cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
 
-        # Cursor de highlight (seleciona a linha inteira para o ExtraSelection).
         hl_cursor = QTextCursor(block)
         hl_cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
         hl_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock,
                                QTextCursor.MoveMode.KeepAnchor)
 
-        # Bloqueia o handler de cursorPositionChanged: sem isso, o
-        # _on_*_cursor_moved chamaria _highlight_func_in_* logo em seguida
-        # e sobrescreveria o highlight do bookmark com o destaque de função.
         self._sync_guard = True
         try:
             target.setTextCursor(nav_cursor)
@@ -1564,7 +1449,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Todos os comentários removidos.", 2000)
 
     def _refresh_comment_display(self):
-        """Recarrega o texto exibido nos painéis, removendo comentários inline excluídos."""
         if self._bytecode_full:
             self._byte_text.setPlainText(
                 self._prepare_display_text(self._bytecode_full, "comments_bc"))
@@ -1581,9 +1465,6 @@ class MainWindow(QMainWindow):
             self._rec_text.setPlainText(
                 self._prepare_display_text(self._recovered_full, "comments_rc"))
 
-    # ------------------------------------------------------------------
-    # Menus de contexto (Copy as...)
-    # ------------------------------------------------------------------
 
     def _bytecode_context_menu(self, pos):
         menu = self._byte_text.createStandardContextMenu()
@@ -1677,40 +1558,31 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText("\n".join(lines))
         self.statusBar().showMessage("Hex copiado.", 2000)
 
-    # ------------------------------------------------------------------
-    # Event filter (atalhos N e ; nos painéis de texto)
-    # ------------------------------------------------------------------
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
-            # --- modo de edição inline de comentário ---
             if self._comment_editing and obj is self._comment_edit_target:
                 key = event.key()
-                # Enter salva, Escape cancela
                 if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                     self._finish_inline_comment(save=True)
                     return True
                 if key == Qt.Key.Key_Escape:
                     self._finish_inline_comment(save=False)
                     return True
-                # Setas verticais: salva e sai
                 if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
                     self._finish_inline_comment(save=True)
                     return True
-                # Backspace: não permitir apagar antes do marcador "  # "
                 if key == Qt.Key.Key_Backspace:
                     cursor = obj.textCursor()
-                    min_col = len(self._comment_edit_original) + 4  # "  # "
+                    min_col = len(self._comment_edit_original) + 4  
                     if cursor.positionInBlock() <= min_col:
                         return True
-                # Bloquear edição de outras linhas
                 cursor = obj.textCursor()
                 if cursor.blockNumber() != self._comment_edit_line:
                     self._finish_inline_comment(save=True)
                     return True
-                return False  # Permite digitação normal
+                return False 
 
-            # --- modo normal ---
             if obj in (self._byte_text, self._rec_text):
                 if event.key() == Qt.Key.Key_N and not event.modifiers():
                     self._rename_at_cursor()
@@ -1719,12 +1591,10 @@ class MainWindow(QMainWindow):
                     self._start_inline_comment()
                     return True
 
-        # Perda de foco encerra edição inline
         if (self._comment_editing and event.type() == QEvent.Type.FocusOut
                 and obj is self._comment_edit_target):
             self._finish_inline_comment(save=True)
 
-        # Tooltip ao passar o mouse sobre linhas comentadas
         if event.type() == QEvent.Type.ToolTip and obj in (self._byte_text, self._rec_text):
             panel = "comments_bc" if obj is self._byte_text else "comments_rc"
             pos = event.pos()
@@ -1740,12 +1610,8 @@ class MainWindow(QMainWindow):
 
         return super().eventFilter(obj, event)
 
-    # ------------------------------------------------------------------
-    # Renomear variáveis/funções (#10)
-    # ------------------------------------------------------------------
 
     def _rename_at_cursor(self):
-        """Renomeia o identificador sob o cursor (com escopo local/global)."""
         focus = QApplication.focusWidget()
         if focus is self._rec_text:
             text_edit = self._rec_text
@@ -1767,7 +1633,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Posicione o cursor sobre um identificador.", 3000)
             return
 
-        # Diálogo com escopo
         dlg = QDialog(self)
         dlg.setWindowTitle("Renomear")
         lay = QVBoxLayout(dlg)
@@ -1819,7 +1684,6 @@ class MainWindow(QMainWindow):
 
     def _prepare_display_text(self, raw_text: str, panel: str,
                               func_name: str | None = None) -> str:
-        """Aplica renomeações (global + local) e injeta comentários inline."""
         gl = self._annotations.get("renames", {})
         lc = self._annotations.get("renames_local", {})
         if gl or lc:
@@ -1835,13 +1699,11 @@ class MainWindow(QMainWindow):
         return self._text_with_comments(text, panel)
 
     def _apply_renames_to_display(self):
-        """Aplica todas as renomeações aos textos exibidos (bytecode + recovered)."""
         gl = self._annotations.get("renames", {})
         lc = self._annotations.get("renames_local", {})
         if not gl and not lc:
             return
 
-        # Recovered: usa a função atual ou o texto completo
         current = self._tree_funcs.currentItem()
         func_name = None
         if current and current.data(0, Qt.ItemDataRole.UserRole) != "__view_all__":
@@ -1854,18 +1716,14 @@ class MainWindow(QMainWindow):
             self._prepare_display_text(raw_rc, "comments_rc", func_name=func_name))
         self._sync_guard = False
 
-        # Bytecode
         self._byte_text.setPlainText(
             self._prepare_display_text(self._bytecode_full, "comments_bc"))
 
         self._render_comment_highlights()
 
-    # ------------------------------------------------------------------
-    # Comentários (#11)
-    # ------------------------------------------------------------------
 
     def _text_with_comments(self, text: str, panel: str) -> str:
-        """Retorna o texto com comentários inline injetados nas linhas."""
+
         comments = self._annotations.get(panel, {})
         if not comments:
             return text
@@ -1880,7 +1738,6 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _strip_inline_comments(self, text: str, panel: str) -> str:
-        """Remove comentários inline do texto, retornando o texto limpo."""
         comments = self._annotations.get(panel, {})
         if not comments:
             return text
@@ -1896,7 +1753,6 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _start_inline_comment(self):
-        """Inicia edição inline de comentário na linha atual."""
         focus = QApplication.focusWidget()
         if focus is self._rec_text:
             panel = "comments_rc"
@@ -1919,7 +1775,6 @@ class MainWindow(QMainWindow):
         block = target.document().findBlockByNumber(line)
         displayed = block.text() if block.isValid() else ""
 
-        # Calcula o texto limpo (sem comentário inline já injetado)
         if existing:
             suffix = f"  # {existing}"
             if displayed.endswith(suffix):
@@ -1936,13 +1791,11 @@ class MainWindow(QMainWindow):
 
         target.setReadOnly(False)
         if not existing:
-            # Novo comentário: insere marcador
             cursor = QTextCursor(block)
             cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
             cursor.insertText("  # ")
             target.setTextCursor(cursor)
         else:
-            # Comentário existente: posiciona no fim para edição
             cursor = QTextCursor(block)
             cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
             target.setTextCursor(cursor)
@@ -1951,7 +1804,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Editando comentário — Enter p/ salvar, Esc p/ cancelar", 0)
 
     def _finish_inline_comment(self, save: bool = True):
-        """Finaliza a edição inline do comentário."""
         if not self._comment_editing:
             return
 
@@ -1965,12 +1817,10 @@ class MainWindow(QMainWindow):
 
         comment = ""
         if save:
-            # Tudo depois do texto limpo é a área de comentário
             comment_area = current_text[len(clean):]
             if comment_area.startswith("  # "):
                 comment = comment_area[4:].strip()
 
-        # Monta o texto final da linha: limpo + comentário (se houver)
         final = clean
         if comment:
             final += f"  # {comment}"
@@ -1981,7 +1831,6 @@ class MainWindow(QMainWindow):
                             QTextCursor.MoveMode.KeepAnchor)
         cursor.insertText(final)
 
-        # Salva anotação
         key = str(line + 1)
         if comment:
             self._annotations.setdefault(panel, {})[key] = comment
@@ -2003,14 +1852,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Edição cancelada.", 2000)
 
     def _render_comment_highlights(self):
-        """Aplica highlights verdes nas linhas com comentários."""
         for panel, text_edit in [("comments_bc", self._byte_text),
                                   ("comments_rc", self._rec_text)]:
             text_edit.setExtraSelections(
                 self._comment_selections_for(panel, text_edit))
 
     def _refresh_comments_list(self):
-        """Atualiza a lista de comentários no painel esquerdo."""
         self._list_comments.clear()
         for panel, prefix in [("comments_bc", "BC"), ("comments_rc", "RC")]:
             comments = self._annotations.get(panel, {})
@@ -2019,7 +1866,6 @@ class MainWindow(QMainWindow):
                 self._list_comments.addItem(f"[{prefix}] L{key}: {text}")
 
     def _on_comment_click(self, item: QListWidgetItem):
-        """Navega ao clicar em um comentário na lista e exibe o texto."""
         text = item.text()
         if text.startswith("[BC]"):
             target = self._byte_text
@@ -2035,7 +1881,7 @@ class MainWindow(QMainWindow):
         if not m:
             return
         key = m.group(1)
-        line = int(key) - 1  # 0-based
+        line = int(key) - 1  
 
         block = target.document().findBlockByNumber(line)
         if block.isValid():
@@ -2048,12 +1894,8 @@ class MainWindow(QMainWindow):
         if comment:
             self.statusBar().showMessage(f"# {comment}", 5000)
 
-    # ------------------------------------------------------------------
-    # Anotações — persistência
-    # ------------------------------------------------------------------
 
     def _load_annotations(self):
-        """Carrega anotações do arquivo .annotations.json."""
         path = self._path_input.text()
         if not path:
             self._annotations = {"renames": {}, "renames_local": {}, "comments_bc": {}, "comments_rc": {}}
@@ -2061,17 +1903,13 @@ class MainWindow(QMainWindow):
         self._annotations = load_annotations(path)
 
     def _save_current_annotations(self):
-        """Salva anotações no arquivo .annotations.json."""
         path = self._path_input.text()
         if path:
             save_annotations(path, self._annotations)
 
-    # ------------------------------------------------------------------
-    # Cross-references (#8)
-    # ------------------------------------------------------------------
+
 
     def _show_xrefs(self, word: str):
-        """Busca e exibe todas as referências a 'word' nos dois painéis."""
         results = []
 
         for panel_name, text_edit in [("Bytecode", self._byte_text),
@@ -2080,7 +1918,6 @@ class MainWindow(QMainWindow):
             block = doc.begin()
             while block.isValid():
                 line_text = block.text()
-                # Busca word-boundary
         
                 if re.search(r"\b" + re.escape(word) + r"\b", line_text):
                     line_no = block.blockNumber() + 1
@@ -2117,12 +1954,9 @@ class MainWindow(QMainWindow):
         lst.itemDoubleClicked.connect(on_double_click)
         dlg.exec()
 
-    # ------------------------------------------------------------------
-    # Estatísticas (#15)
-    # ------------------------------------------------------------------
 
     def _show_stats(self):
-        """Abre o diálogo de estatísticas do bytecode."""
+
         bc = self._byte_text.toPlainText()
         rc = self._rec_text.toPlainText()
         if not bc.strip():
@@ -2133,12 +1967,8 @@ class MainWindow(QMainWindow):
         dlg = StatsDialog(self, bc, rc, self.bytecode_meta, path, elapsed)
         dlg.exec()
 
-    # ------------------------------------------------------------------
-    # Gerenciamento de sessões (múltiplas abas)
-    # ------------------------------------------------------------------
 
     def _save_session(self, sid: int):
-        """Captura o estado atual nos dados da sessão."""
         s = self._sessions.get(sid)
         if s is None:
             return
@@ -2163,12 +1993,10 @@ class MainWindow(QMainWindow):
         s["byte_scroll"] = self._byte_text.verticalScrollBar().value()
         s["rec_scroll"] = self._rec_text.verticalScrollBar().value()
         s["hex_scroll"] = self._hex_text.verticalScrollBar().value()
-        # Função selecionada na árvore de code objects
         cur = self._tree_funcs.currentItem()
         s["selected_func"] = cur.data(0, Qt.ItemDataRole.UserRole) if cur else None
 
     def _restore_session(self, sid: int):
-        """Restaura o estado da sessão nos widgets."""
         s = self._sessions.get(sid)
         if s is None or "byte_txt" not in s:
             return
@@ -2200,7 +2028,6 @@ class MainWindow(QMainWindow):
         self._populate_lists()
         self._refresh_bookmarks()
 
-        # Restaura a função selecionada na árvore (antes de render highlights)
         sel_func = s.get("selected_func")
         if sel_func and sel_func != "__view_all__":
             target = self._find_tree_item_by_name(sel_func)
@@ -2211,7 +2038,6 @@ class MainWindow(QMainWindow):
         self._refresh_comments_list()
         self._update_statusbar()
 
-        # Restaura posições de scroll
         self._byte_text.verticalScrollBar().setValue(s.get("byte_scroll", 0))
         self._rec_text.verticalScrollBar().setValue(s.get("rec_scroll", 0))
         self._hex_text.verticalScrollBar().setValue(s.get("hex_scroll", 0))
@@ -2222,13 +2048,11 @@ class MainWindow(QMainWindow):
         })
 
     def _switch_tab(self, idx: int):
-        """Troca para a aba indicada."""
         if idx < 0:
             return
         new_sid = self._tab_bar.tabData(idx)
         if new_sid is None or new_sid == self._active_sid:
             return
-        # Finaliza edição inline de comentário pendente antes de trocar
         if self._comment_editing:
             self._finish_inline_comment(save=True)
         if self._active_sid >= 0:
@@ -2236,22 +2060,10 @@ class MainWindow(QMainWindow):
         self._active_sid = new_sid
         self._restore_session(new_sid)
         self._show_main()
-        # Ajusta estado "busy" para refletir se há worker ainda rodando na aba destino.
         self._set_busy(new_sid in self._workers)
-        # Força um ciclo de resize idêntico ao que "maximizar" faz — resolve
-        # offset cumulativo no hit-test que o restore deixa pendente em Qt.
         QTimer.singleShot(0, self._force_relayout)
 
     def _force_relayout(self):
-        """Replica o efeito de maximizar/restaurar a janela: reconcilia geometria.
-
-        Após _restore_session, Qt deixa eventos de layout pendentes que não
-        são drenados antes do primeiro clique — o hit-test de QListWidget e
-        QPlainTextEdit usa geometria antiga e os cliques caem ~20px abaixo
-        do item visível. Um resize real da janela dispara resizeEvent em
-        todos os filhos e força o relayout. Delta de 8 pixels é grande o
-        bastante para o Qt não coalescer como no-op.
-        """
         if self.isMaximized() or self.isFullScreen():
             return
         size = self.size()
@@ -2259,12 +2071,10 @@ class MainWindow(QMainWindow):
         self.resize(size)
 
     def _close_tab(self, idx: int):
-        """Fecha a aba indicada."""
-        # Finaliza edição inline de comentário pendente
         if self._comment_editing:
             self._finish_inline_comment(save=True)
         sid = self._tab_bar.tabData(idx)
-        # Garante que a sessão ativa tem dados atualizados antes de fechar
+
         if sid == self._active_sid:
             self._save_session(sid)
         session = self._sessions.get(sid, {})
@@ -2295,24 +2105,16 @@ class MainWindow(QMainWindow):
         else:
             self._show_splash()
 
-    # ------------------------------------------------------------------
-    # Grafo de fluxo (CFG) (#12)
-    # ------------------------------------------------------------------
 
     def _show_cfg(self):
-        """Abre o diálogo de CFG."""
         if not self._func_meta:
             self.statusBar().showMessage("Nenhum bytecode carregado.", 3000)
             return
         dlg = CfgView(self, self._byte_text.toPlainText(), self._func_meta)
         dlg.exec()
 
-    # ------------------------------------------------------------------
-    # Diff (#13)
-    # ------------------------------------------------------------------
 
     def _compare_files(self):
-        """Abre um segundo arquivo e compara com o atual."""
         current_rc = self._rec_text.toPlainText()
         if not current_rc.strip():
             self.statusBar().showMessage("Carregue um arquivo antes de comparar.", 3000)
@@ -2343,21 +2145,14 @@ class MainWindow(QMainWindow):
         dlg = DiffView(self, current_rc, other_rc, label_a, label_b)
         dlg.exec()
 
-    # ------------------------------------------------------------------
-    # Console Python (#20)
-    # ------------------------------------------------------------------
 
     def _toggle_console(self, checked: bool):
         self._console_group.setVisible(checked)
         if checked:
             self._console.setFocus()
 
-    # ------------------------------------------------------------------
-    # Encerramento
-    # ------------------------------------------------------------------
 
     def closeEvent(self, event):
-        # Salva anotações de todas as sessões
         if self._active_sid >= 0:
             self._save_session(self._active_sid)
         for sid, session in self._sessions.items():
